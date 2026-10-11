@@ -1,6 +1,6 @@
-# Alice Agent v0.8.3 — Conversation Continuity Across Reloads
+# Alice Agent v0.8.4 — Rest Lifecycle and Persistent Decision Metrics
 
-Alice Agent 是与 AstrBot 解耦的、状态持续的事件驱动角色 Agent Core。AstrBot 仍只负责平台接入、当前会话 LLM Provider、消息发送和插件生命周期；事件、State、Drive、Relationship、Memory、Planner 与行为克制机制均位于独立 Core。v0.8.3 在 v0.8.2 基础上补齐插件重载后的短期对话与心境恢复。
+Alice Agent 是与 AstrBot 解耦的、状态持续的事件驱动角色 Agent Core。AstrBot 仍只负责平台接入、当前会话 LLM Provider、消息发送和插件生命周期；事件、State、Drive、Relationship、Memory、Planner 与行为克制机制均位于独立 Core。v0.8.4 修复持续 Tick 下的闲置与休息状态闭环，增加决策指标持久化及诊断日志管理；保留 v0.8.3 的重载会话恢复和模型回退。
 
 > 当前工作区的内容记忆后端是纯本地 SQLite，不存在 TencentDB / MemoryCore Adapter。v0.6 没有伪造或重做远端集成。SharedExperience 已有模型和持久化入口，但尚未自动提取 Autobiographical Memory。
 
@@ -8,7 +8,14 @@ Alice Agent 是与 AstrBot 解耦的、状态持续的事件驱动角色 Agent C
 
 源码仓库：[3039149572/Alice-agent](https://github.com/3039149572/Alice-agent)。服务器安装、迁移和后续更新步骤见 [`SERVER_UPDATE.md`](SERVER_UPDATE.md)。仓库只发布源码，音频、表情素材和实例数据独立保管。
 
-2026-10-11 修复：模型调用失败、返回错误或空回复时，按 AstrBot 当前会话配置的备用模型列表顺序回退；保留原有总超时。新增 16 项回归测试，全量 225 项通过。重载插件后生效。
+2026-10-11 v0.8.4：全量 238 项本地测试通过，源码编译与配置 schema 解析通过。升级后重载插件生效。版本变化见 [CHANGELOG.md](CHANGELOG.md)。真实 QQ 送达、语音播放和 Jev 中文质量仍需线上验收。
+
+## v0.8.4 运行改进
+
+- AgentLoop 用最后一次用户交互计算累计闲置：15 分钟后退出聊天状态；闲置至少 30 分钟且满足 `rest_need ≥ 0.60`、精力 `≤ 0.35` 之一时进入休息。休息需求恢复到 `≤ 0.20` 且精力 `≥ 0.60` 后退出；新用户文本仍按原有 StateReducer 进入聊天。每 Tick 的情绪效价以每小时 0.02 向零回归，不依赖每日事件开关。这些是角色状态规则，不是用户睡眠检测。
+- `decision_metrics_persistence_enabled=true` 默认把按任务类型累计的 Jev 计数、延迟、回退和 token 数保存到 `alice_metrics.db`，每 30 秒及正常卸载时保存。异常退出可能丢失尚未保存的计数；读取失败时不覆盖旧数据，聊天继续。指标不含私聊文本、用户标识和密钥；不是实际费用或质量证明，也未按模型／模式／日期分组。
+- `media_log_tts_inputs=false` 默认不在 AstrBot 运行日志中记录 TTS 原文、译文和参考路径。需排障时单独开启并重载；它与 `test_log_enabled` 独立，已有运行日志不会删除。
+- `test_log_retention_days=0` 默认不自动删除既有诊断。设为正数后，仅在写入诊断时最多每小时清理一次过期的插件 JSON 文件，按修改时间判断；不递归、不处理其他文件或 AstrBot 运行日志。关闭 `test_log_enabled` 后不执行清理。
 
 ## 架构与数据流
 
@@ -308,7 +315,7 @@ $env:PYTHONPATH='E:\AstrBot\backend\app'
 & 'E:\AstrBot\backend\python\python.exe' -m unittest discover -s astrbot_plugin_alice_agent\tests -t . -v
 ```
 
-2026-09-30 v0.8.3 全量回归 209 项通过（`unittest discover`，AstrBot bundled Python）；源码编译检查和配置 schema 解析也通过。v0.8.2 为 195 项，v0.8.1 为 184 项，v0.8.0 为 155 项，v0.7.0 为 122 项。新增测试使用临时真实 SQLite 验证重建插件实例后恢复上下文与心境、取消分段发送只恢复已 yield 首句、隔离与期限、损坏数据修复、存储失败及并发首次恢复。Jev、LLM、AstrBot 与媒体使用 mock/fake，不调用真实模型或 QQ；这些测试证明本地控制流与框架交接，不证明线上聊天质量或平台实际送达。
+2026-10-11 v0.8.4 全量回归 238 项通过（`unittest discover`，AstrBot bundled Python）；源码编译检查和配置 schema 解析也通过。新增 13 项覆盖连续 Tick 的休息闭环、临时真实 SQLite 指标恢复、存储失败与卸载竞态、诊断保留与 TTS 日志开关。v0.8.3 的 209/225 项及更早数量为历史快照。既有回归还覆盖重建插件实例后恢复上下文与心境、取消分段发送只恢复已 yield 首句、隔离与期限、损坏数据修复及并发首次恢复。Jev、LLM、AstrBot 与媒体使用 mock/fake，不调用真实模型或 QQ；这些测试证明本地控制流与框架交接，不证明线上聊天质量或平台实际送达。
 
 ## 当前未实现与限制
 

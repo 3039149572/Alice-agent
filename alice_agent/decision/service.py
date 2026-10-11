@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -10,6 +11,7 @@ from typing import Any, MutableMapping
 from uuid import uuid4
 
 from ..ports.logging import LoggerPort, NullLogger
+from ..ports.storage import StoragePort
 from .fallback import DecisionTimeoutError, DecisionValidationError
 from .metrics import DecisionMetrics
 from .models import DecisionMode, DecisionQuestion, DecisionResult
@@ -28,6 +30,8 @@ class DecisionService:
         logger: LoggerPort | None = None,
         cache_ttl_seconds: float = 30.0,
         cache_limit: int = 256,
+        metrics_storage: StoragePort | None = None,
+        metrics_flush_seconds: float = 30.0,
     ) -> None:
         self._port = port
         self.mode = mode
@@ -38,6 +42,51 @@ class DecisionService:
         self._cache_ttl = max(0.0, cache_ttl_seconds)
         self._cache_limit = max(0, cache_limit)
         self._cache: OrderedDict[str, tuple[float, DecisionResult]] = OrderedDict()
+        self._metrics_storage = metrics_storage
+        self._metrics_flush_seconds = max(1.0, metrics_flush_seconds)
+        self._metrics_lock = asyncio.Lock()
+        self._metrics_loaded = False
+        self._metrics_writable = True
+        self._metrics_task: asyncio.Task | None = None
+        self._metrics_stop = asyncio.Event()
+        self._closed = False
+
+    async def start(self) -> None:
+        if self._metrics_storage is None or self._metrics_loaded or self._closed:
+            return
+        async with self._metrics_lock:
+            if self._metrics_loaded or self._closed:
+                return
+            try:
+                payload = await self._metrics_storage.get("decision_metrics", "totals")
+                self.metrics.restore(payload)
+            except Exception as exc:
+                # A failed read must not overwrite counters we could not load.
+                self._metrics_writable = False
+                self._logger.warning(f"Alice decision metrics restore failed ({type(exc).__name__})")
+            self._metrics_loaded = True
+            if self._metrics_writable:
+                self._metrics_task = asyncio.create_task(self._metrics_worker())
+
+    async def flush_metrics(self) -> None:
+        await self.start()
+        async with self._metrics_lock:
+            if self._metrics_storage is None or not self._metrics_writable:
+                return
+            try:
+                await self._metrics_storage.set("decision_metrics", "totals", {
+                    "schema_version": 1,
+                    "buckets": self.metrics.snapshot(),
+                })
+            except Exception as exc:
+                self._logger.warning(f"Alice decision metrics save failed ({type(exc).__name__})")
+
+    async def _metrics_worker(self) -> None:
+        while not self._metrics_stop.is_set():
+            try:
+                await asyncio.wait_for(self._metrics_stop.wait(), self._metrics_flush_seconds)
+            except TimeoutError:
+                await self.flush_metrics()
 
     @property
     def enabled(self) -> bool:
@@ -106,6 +155,7 @@ class DecisionService:
         trace_id: str,
         attempt_diagnostics: MutableMapping[str, Any] | None = None,
     ) -> DecisionResult | None:
+        await self.start()
         attempt_started = time.perf_counter()
         if not self.enabled:
             if attempt_diagnostics is not None:
@@ -264,5 +314,20 @@ class DecisionService:
         self.metrics.bucket(decision_type).llm_calls_avoided += 1
 
     async def close(self) -> None:
-        if self._port is not None:
-            await self._port.close()
+        if self._closed:
+            return
+        await self.start()
+        self._closed = True
+        self._metrics_stop.set()
+        if self._metrics_task is not None:
+            # Finish any SQLite write already in flight before the final save.
+            await asyncio.gather(self._metrics_task, return_exceptions=True)
+        try:
+            await self.flush_metrics()
+        finally:
+            try:
+                if self._port is not None:
+                    await self._port.close()
+            finally:
+                if self._metrics_storage is not None:
+                    await self._metrics_storage.close()

@@ -15,6 +15,24 @@
     "default": false,
     "hint": "日志保存在插件数据目录 test_turns/。记录包含完整用户与 Alice 回复文本，请按本机隐私要求保管；关闭不会删除旧记录。"
   },
+  "test_log_retention_days": {
+    "description": "逐轮诊断 JSON 保留天数；0 为不自动删除",
+    "type": "int",
+    "default": 0,
+    "hint": "设为正数后，在写入诊断时最多每小时清理一次过期的插件诊断文件（按文件修改时间）。关闭 test_log_enabled 后不执行清理；不处理 AstrBot 运行日志。"
+  },
+  "media_log_tts_inputs": {
+    "description": "在 AstrBot 运行日志中记录 TTS 原文、译文及参考音频路径",
+    "type": "bool",
+    "default": false,
+    "hint": "包含私聊内容，默认关闭。与 test_log_enabled 独立；需要重载插件生效。关闭不删除已有运行日志。"
+  },
+  "decision_metrics_persistence_enabled": {
+    "description": "持久化 Jev 决策汇总指标，支持重载恢复",
+    "type": "bool",
+    "default": true,
+    "hint": "只保存按任务类型汇总的计数、延迟和 token 数，不包含私聊文本、用户标识或密钥。每 30 秒及正常卸载时保存；异常退出可能损失尚未保存的计数，存储故障时可能更久。保存在 alice_metrics.db，关闭不删除旧数据。"
+  },
   "daily_events_enabled": {
     "description": "启用按会话隔离的每日小事件和持久化心境",
     "type": "bool",

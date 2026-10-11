@@ -188,7 +188,7 @@ class MediaRendererTests(unittest.IsolatedAsyncioTestCase):
                 MediaConfig(
                     enabled=True, character_name="alice", onnx_model_dir="model",
                     language="chinese", default_ref_audio=str(reference),
-                    default_ref_text="参考文本",
+                    default_ref_text="参考文本", log_tts_inputs=True,
                 ),
                 FakeLLM(), logger, root / "temp", client=client,
             )
@@ -227,6 +227,7 @@ class MediaRendererTests(unittest.IsolatedAsyncioTestCase):
                     enabled=True, character_name="alice", onnx_model_dir="model",
                     language="japanese", deepl_api_key="secret:fx",
                     default_ref_audio=str(default_ref), default_ref_text="默认参考文本",
+                    log_tts_inputs=True,
                 ),
                 RecordingLLM(), logger, root / "temp", client=client,
             )
@@ -332,7 +333,8 @@ class MediaRendererTests(unittest.IsolatedAsyncioTestCase):
                 default_ref_audio=str(reference),
                 default_ref_text="参考文本",
             )
-            renderer = AstrBotMediaRenderer(config, FakeLLM(), FakeLogger(), root / "temp", client=client)
+            logger = FakeLogger()
+            renderer = AstrBotMediaRenderer(config, FakeLLM(), logger, root / "temp", client=client)
             await renderer.initialize()
             rendered = await renderer.render(
                 "session", "这是一条用于语音合成的回复。",
@@ -343,6 +345,8 @@ class MediaRendererTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/load_character", calls)
             self.assertIn("/set_reference_audio", calls)
             self.assertIn("/tts", calls)
+            self.assertFalse(config.log_tts_inputs)
+            self.assertFalse(any("TTS inputs" in entry or "这是一条" in entry or str(reference) in entry for entry in logger.infos))
             await renderer.close()
             await client.aclose()
 

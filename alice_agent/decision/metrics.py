@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 
@@ -43,6 +45,36 @@ class DecisionMetrics:
 
     def bucket(self, decision_type: str) -> DecisionMetricBucket:
         return self._buckets[decision_type]
+
+    def restore(self, payload: object) -> None:
+        """Merge validated counters only; never restore text or derived ratios."""
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("schema_version")) is not int
+            or payload["schema_version"] != 1
+        ):
+            return
+        buckets = payload.get("buckets")
+        if not isinstance(buckets, dict) or len(buckets) > 128:
+            return
+        for name, values in buckets.items():
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,80}", name):
+                continue
+            if not isinstance(values, dict):
+                continue
+            validated = {}
+            for field_name, default in asdict(DecisionMetricBucket()).items():
+                value = values.get(field_name, default)
+                if field_name == "latency_total_ms":
+                    if type(value) not in (float, int) or not 0 <= value <= 1e18 or not math.isfinite(value):
+                        break
+                elif type(value) is not int or not 0 <= value <= 10**18:
+                    break
+                validated[field_name] = value
+            else:
+                bucket = self.bucket(name)
+                for field_name, value in validated.items():
+                    setattr(bucket, field_name, getattr(bucket, field_name) + value)
 
     def snapshot(self) -> dict[str, dict[str, float | int]]:
         result: dict[str, dict[str, float | int]] = {}

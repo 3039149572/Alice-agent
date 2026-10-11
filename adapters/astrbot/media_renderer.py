@@ -244,17 +244,18 @@ class AstrBotMediaRenderer:
                 spoken = await self._translate(session_id, prepared)
                 # Log the reference that Genie actually holds, rather than a
                 # candidate path that may have fallen back to the current one.
-                self._logger.info(
-                    "Alice media: TTS inputs " + json.dumps(
-                        {
-                            "reference_audio": self._current_ref_path,
-                            "reference_text": self._current_ref_text,
-                            "source_text": prepared,
-                            "translated_text": spoken,
-                        },
-                        ensure_ascii=False,
+                if self._config.log_tts_inputs:
+                    self._logger.info(
+                        "Alice media: TTS inputs " + json.dumps(
+                            {
+                                "reference_audio": self._current_ref_path,
+                                "reference_text": self._current_ref_text,
+                                "source_text": prepared,
+                                "translated_text": spoken,
+                            },
+                            ensure_ascii=False,
+                        )
                     )
-                )
                 audio_path = await self._synthesize(spoken)
                 previous = self._last_audio_path
                 self._last_audio_path = audio_path

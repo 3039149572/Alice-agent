@@ -1,8 +1,8 @@
-# Alice Agent v0.8.3 交接文档
+# Alice Agent v0.8.4 交接文档
 
-最后核验日期：2026-10-11（模型回退专项；其余实例状态保留各段原核验日期）  
+最后核验日期：2026-10-11（v0.8.4 本地运行逻辑与模型回退；实例状态保留各段原核验日期）
 项目路径：`C:\Users\Administrator\.astrbot\data\plugins\astrbot_plugin_alice_agent`  
-当前版本：`0.8.3`  
+当前版本：`0.8.4`
 AstrBot 兼容声明：`>=4.25.5,<5`
 
 本文档面向接手该项目的新对话或新开发者。它描述当前工作区真实存在的实现，不代表最初需求文档中的所有设想都已经完成。
@@ -18,14 +18,15 @@ AstrBot 兼容声明：`>=4.25.5,<5`
 7. Response Generator 优先使用 AstrBot 当前会话的 LLM Provider；2026-10-11 修复后，失败时按当前会话配置顺序尝试备用模型。Jev 不生成回复文本。
 8. `alice_agent/` Core 不依赖 AstrBot、httpx、TypeSafe SDK 或 TypeSafe endpoint。
 9. Reactive 回复支持可选 Genie TTS 与表情包选择（默认 `media_enabled=false`）；QQ 官方平台语音独立发送，主动消息仍为纯文本，文本均可逐句发送。
-10. v0.7.0（2026-09-28）122 项；v0.8.0（2026-09-29）155 项；v0.8.1（2026-09-29）184 项；v0.8.2（2026-09-29）195 项；v0.8.3（2026-09-30）全量 209 项通过，源码编译与配置 schema 解析通过。2026-10-11 模型回退修复新增 16 项，全量 225 项与源码编译通过；版本号仍为 0.8.3。
+10. v0.8.4（2026-10-11）新增 13 项，全量 238 项、源码编译和配置 schema 解析通过。v0.8.3 的 209 项（2026-09-30）及模型回退修复后的 225 项（2026-10-11）是历史基线。
 11. 本地语义 VAD 默认启用；Jev 是否运行仍由现有 `jev_enabled` 与凭据控制，未启用时不调用远端。
 12. 逐轮诊断 JSON 默认关闭；启用会保存敏感私聊文本及模型/状态诊断。
 13. 此前本机已完成 Genie TTS 与本地 WAV→QQ Record→Silk 贯通验证，但尚未做 QQ 平台实际送达验收。
 14. 2026-10-11 已在项目目录初始化独立 Git 仓库（`main`），远端为 `https://github.com/3039149572/Alice-agent.git`。仅跟踪源码、提示词、配置字段定义、文档和测试；本地音频、表情、缓存、压缩包和运行数据不提交。服务器安装与更新见 `SERVER_UPDATE.md`。
 15. `daily_events_enabled` 的 schema 默认仍为关闭；2026-09-29 只读核对的本机配置显式为 `true`，属于实例值。每日生活分享依赖每日事件开启，不是强制每日发送。
-16. 2026-09-29 只读核对的当前实例值为 `media_enabled=true`、`media_emoji_enabled=true`、`test_log_enabled=true`、`daily_events_enabled=true`、Jev `shadow`、`jev_review_threshold=0.60`；这些是运行配置，不是插件默认值。v0.8.2 的 Jev 实际采用下限仍固定 0.80。代码修改没有重载插件或改写运行配置。
+16. 2026-09-29 的历史实例记录为 `media_enabled=true`、`media_emoji_enabled=true`、`test_log_enabled=true`、`daily_events_enabled=true`、Jev `shadow`、`jev_review_threshold=0.60`；这些不是插件默认值，也未在本次核对为当前值。Jev 实际采用下限仍固定 0.80。代码修改没有重载插件或改写运行配置。
 17. v0.8.1 的回复风格提示由本地规则构造，不增加 LLM/Jev 调用；表情语义对齐是有限的确定性筛选，不读取图片像素、不保证中文语义准确，也未做真实 QQ 平台送达验收。
+18. v0.8.4 补齐按实际闲置时间进入/退出休息的确定性规则，默认保存无文本的 Jev 汇总指标；TTS 原文/译文日志改为默认关闭，诊断保留期限为可选配置。详细变更见 `CHANGELOG.md`。
 
 ## 2. 当前总体定位
 
@@ -97,7 +98,7 @@ LLM generation
 | Proactive Behavior | 已完成 | Candidate、评分、Cooldown、Budget、活跃会话保护、安静失败 |
 | Scheduler | 已完成基础 | ScheduledContextEvent 结构与持久化；没有自然语言自动抽取 |
 | Jev Decision Layer | 已完成基础 | off/shadow/hybrid/primary；Perception/Memory/Planner/Proactive/Media/Daily Event 接入 |
-| Decision Metrics | 已完成进程内统计 | latency、fallback、confidence、disagreement、LLM avoided、usage |
+| Decision Metrics | 已完成本地持久化基础 | latency、fallback、confidence、disagreement、LLM avoided、usage；默认每 30 秒及正常卸载时保存，重载恢复 |
 | Reactive Media | 已完成基础 | 旧索引复用、本地 VAD/能量/文本筛选、Jev 有界选择、保守表情语义对齐、Genie TTS、延迟表情发送 |
 | Test-turn JSON | 已完成基础 | 默认关闭；逐轮原子 JSON 记录情绪分数、阶段诊断、有限表情候选资格摘要和交给框架的文本 |
 | Segmented sending | 已完成基础 | Reactive/Proactive 默认启用，按可读边界拆分并按会话串行发送 |
@@ -340,7 +341,8 @@ AstrBot Adapter 在 Pipeline 返回后执行媒体 I/O：若选择语音则按 G
 - v0.8.3 的 `session_persistence_enabled=true` 默认保存心境和有界近期对话；关闭后，心境仅在每日事件仍启用时保持既有 SQLite 持久化，近期 History 使用内存。
 - 使用 `StateReducer`，LLM/Jev 都不能直接设置数值。
 - 每次用户事件在 session lock 内更新。
-- `TimeStateReducer` 让 arousal/energy 随时间回归 baseline。
+- `TimeStateReducer` 让 valence/arousal/energy 随时间回归 baseline；v0.8.4 增加 valence 每小时 0.02 向零回归，不依赖每日事件开关。
+- AgentLoop 以最后一次用户交互计算累计闲置，避免把单次 30 秒 Tick 当成全部闲置时间。累计 15 分钟退出 `chatting`；累计至少 30 分钟且满足休息需求 ≥0.60、精力 ≤0.35 之一时进入 `resting`。休息需求 ≤0.20 且精力 ≥0.60 后回到 `idle`；新用户文本按原 StateReducer 进入 `chatting`。关闭 rest drive 时，旧的休息需求不参与状态进入/退出判断。规则描述的是角色状态，不是用户睡眠或锁屏信号。
 - `DailyMoodReducer` 在换日时使 V/A/D、精力、压力和孤独感向基线渐进恢复，并叠加有界事件影响；每日事件按 session 隔离，重启后不重复施加。
 
 ### 会话连续性（v0.8.3）
@@ -386,7 +388,8 @@ data/plugin_data/astrbot_plugin_alice_agent/
 ├── alice_intelligence.db
 ├── alice_autonomy.db
 ├── alice_mood.db
-└── alice_sessions.db
+├── alice_sessions.db
+└── alice_metrics.db
 ```
 
 职责：
@@ -409,6 +412,8 @@ data/plugin_data/astrbot_plugin_alice_agent/
   - 每日事件批次（每日事件启用时）
 - `alice_sessions.db`
   - 有界近期对话快照（会话连续性启用时）
+- `alice_metrics.db`
+  - 按决策任务类型累计的 Jev 汇总指标（默认开启，不包含私聊原文、用户标识和密钥）
 
 ### Recall 流程
 
@@ -589,7 +594,7 @@ score =
 - 每用户滚动 24 小时预算：1 条
 - 用户消息后活跃保护：15 分钟
 
-可选每日生活分享候选依赖 `daily_events_enabled=true`，仅从当日已生成事件中选取；本地时间默认 09:00–21:00。每会话每天最多 2 次日常事件的模型规划尝试（每个 Tick 仍会做轻量候选评估），且仍受活跃保护、评分、Jev gate、冷却及原有每天最多 1 条的 proactive budget。这个候选不会强制每天发送；每日事件总开关 schema 默认 false，本机最近核对未配置该字段，因此仍为 false。
+可选每日生活分享候选依赖 `daily_events_enabled=true`，仅从当日已生成事件中选取；本地时间默认 09:00–21:00。每会话每天最多 2 次日常事件的模型规划尝试（每个 Tick 仍会做轻量候选评估），且仍受活跃保护、评分、Jev gate、冷却及原有每天最多 1 条的 proactive budget。这个候选不会强制每天发送；每日事件总开关 schema 默认 false，2026-09-29 历史实例记录为 true，当前实例值需另行核对。
 
 用户新消息会：
 
@@ -756,7 +761,7 @@ v0.8.1 在本地候选决策中增加有限的表情语义对齐：使用最终�
 - 同时读取旧插件配置作为新字段为空时的兼容回退；旧监听地址 `0.0.0.0` 在客户端侧转换为 `127.0.0.1`。
 - Genie 使用 `/load_character`、`/set_reference_audio`、`/tts`，持久化 `httpx.AsyncClient`。
 - 日文/英文 TTS 优先使用 DeepL 官方 API（配置 `media_deepl_api_key` 或 `DEEPL_API_KEY` 后启用）；无密钥、接口失败或结果无效时回退当前 AstrBot 会话 Provider。不复制旧插件的非官方 DeepL 免费接口。
-- 每次真正准备合成语音时，AstrBot 运行日志 `Alice media: TTS inputs` 记录实际参考音频路径、参考文本、处理后的原文和最终译文；这不依赖 `test_log_enabled`，日志可能包含私聊文本和本机路径，但不包含 DeepL 密钥。
+- v0.8.4 起 `media_log_tts_inputs=false` 默认关闭 TTS 输入日志。显式开启并重载后，AstrBot 运行日志 `Alice media: TTS inputs` 才记录实际参考音频路径、参考文本、处理后的原文和最终译文；与 `test_log_enabled` 独立，关闭不删除已有运行日志。
 - RIFF WAV 原样保存；原始 PCM 封装为 32kHz/mono/16bit WAV。
 - 语音与文本同一消息链发送；表情默认延迟 0.5 秒。
 - 媒体只装饰 Reactive 回复；Proactive sender 仍发送纯文本，但长内容会分段。
@@ -780,7 +785,7 @@ Trace：
 
 默认不记录完整用户文本或完整 Memory。
 
-进程内 Metrics：
+Metrics 汇总：
 
 - calls
 - latency_avg_ms
@@ -793,7 +798,9 @@ Trace：
 - llm_calls_avoided
 - input/output tokens
 
-Metrics 当前重启后丢失，没有持久化或管理面板。
+v0.8.4 默认 `decision_metrics_persistence_enabled=true`，经 `StoragePort` 保存到 `alice_metrics.db`，每 30 秒及正常卸载时写入；卸载等待已开始的保存结束再写最终快照。首次读取通过 schema、类型和有限非负数校验恢复汇总，坏桶跳过；读取失败时本实例保持内存统计且不覆盖旧记录，写入失败可在下一次保存重试。关闭开关不读写或删除旧指标。
+
+只保存按任务类型累计的计数、累计延迟和 token 数；派生比例按恢复后的计数重新计算。没有用户标识、私聊文本、提示词、逐轮决策或密钥。指标尚未按模型/模式/日期分组，也没有管理面板；不能直接用于模型质量或实际费用结论。异常退出可能损失最近一次保存之后的计数，保存间隔并不是故障情况下的严格损失上限。
 
 ## 14. Context 与 Prompt 边界
 
@@ -834,6 +841,8 @@ v0.8.1 回复风格提示由本地规则从当前消息组与最近 16 轮中最
 - 只允许纯文本安全合并；媒体/不确定消息独立保留边界。局部 delivery guard 在各句发送前运行，插话不会继续发送过期的剩余段落。
 
 ## 16. 日志与隐私
+
+v0.8.4 增加 `test_log_retention_days`（默认 0，不自动删除）。设为正数且诊断开启时，在新增 JSON 后最多每小时清理一次过期文件，按文件修改时间判断；仅匹配诊断目录内插件生成的普通 JSON 文件，不递归、不跟随符号链接、不清理 AstrBot 运行日志。关闭 `test_log_enabled` 后不执行清理。关闭日志开关不等于清除历史记录。
 
 INFO：
 
@@ -954,6 +963,9 @@ DEBUG：
 | vad_timeout_ms | 5000 |
 | jev_vad_weight | 0.5（实际回复情绪混合权重） |
 | test_log_enabled | false |
+| test_log_retention_days | 0（不自动删除） |
+| media_log_tts_inputs | false |
+| decision_metrics_persistence_enabled | true |
 | segmented_send_enabled | true |
 | segmented_send_max_chars | 120 |
 | segmented_send_interval_seconds | 1.0 |
@@ -1002,14 +1014,14 @@ $env:PYTHONPATH='E:\AstrBot\backend\app'
 & 'E:\AstrBot\backend\python\python.exe' -m compileall -q astrbot_plugin_alice_agent
 ```
 
-最后验证结果（2026-10-11，v0.8.3 模型回退修复）：
+最后验证结果（2026-10-11，v0.8.4 本地运行改进）：
 
 ```text
-Ran 225 tests
+Ran 238 tests
 OK
 ```
 
-2026-09-30 的 209 项、2026-09-23 的 109 项和 v0.7.0（2026-09-28）的 122 项只是历史快照。
+2026-10-11 模型回退修复后的 225 项、2026-09-30 的 209 项、2026-09-23 的 109 项和 v0.7.0（2026-09-28）的 122 项只是历史快照。
 
 覆盖范围：
 
@@ -1029,6 +1041,9 @@ OK
 - Memory → Planner → Response 数据流
 - Event Bus 去重
 - FakeClock 1h/5h/1d
+- 连续 30 秒 Tick 下累计闲置、休息进入/恢复/退出、新消息唤醒、关闭休息驱动及效价向基线回归
+- 临时真实 SQLite 指标恢复与追加、并发初始化、坏桶过滤、读失败保护、写失败重试、后台保存与卸载竞态、插件配置开关
+- 默认关闭 TTS 私聊输入日志、显式开启仍记录实际参考与译文、诊断保留范围与关闭时不清理
 - Agent Loop lifecycle
 - 24h anti-spam budget
 - pending action cancellation
@@ -1054,7 +1069,7 @@ OK
 2. 当前实例有 Jev 凭据且处于 `shadow`，但缺少足以支持质量/成本结论的正式中文分层评估；不能据此宣称其已提高准确率或降低成本。
 3. 官方说明 Jev 英语效果最佳；中文需要 shadow 数据集校准。
 4. Jev raw HTTP 对 429/529 当前安全 fallback，没有有限重试/circuit breaker。
-5. Jev Metrics 只在进程内，reload 后丢失。
+5. Jev Metrics 已可持久化，但尚未按模型/模式/日期分组，没有 p95 或端到端阶段耗时汇总；异常退出可能丢失未保存的计数。
 6. 当前 confidence thresholds 全模块共享，未按任务分别校准。
 7. Jev Perception topic 仍为 `general`。
 8. Local Memory 是词法检索，不是真正的向量语义检索。
@@ -1065,7 +1080,7 @@ OK
 13. `qq_official` 主动发送能力取决于平台；aiocqhttp/NapCat 是主要目标。
 14. 没有管理 UI 查看 Decision/Loop Metrics。
 15. 没有端到端真实 QQ + Jev shadow 长期运行验证。
-16. 当前机器核验时 `127.0.0.1:8000` 不可连接；真实 Genie 音色、速度和 QQ Record 播放尚未验收。
+16. 旧核验曾发现 `127.0.0.1:8000` 不可连接；本次未重新探测外部服务，不能把旧结果视为当前状态。真实 Genie 音色、速度和 QQ Record 播放尚未验收。
 17. Media 只覆盖 Reactive 回复；Proactive 内容仍为纯文本，但支持分段发送。
 18. 新插件读取既有索引，但不包含 `/dg-build-audio` / `/dg-build-emoji` 等索引构建命令。
 
@@ -1093,18 +1108,18 @@ OK
 
 不要把预留的数据结构描述成已经完成的功能。
 
-## 21. 推荐下一步，但尚未授权实施
+## 21. 下一步建议与验证边界
 
 优先顺序建议：
 
-1. 在明确用户同意和隐私边界后启用 Jev shadow。
+1. 先核对实际运行版本和当前配置，再做真实 QQ 文本、分段插话、重载恢复、语音播放与模型回退验收。历史实例已启用 Jev shadow，无需重复要求首次启用；shadow 的情绪混合仍生效，评估时必须控制这个变量。
 2. 收集至少 100 条真实中文决策样本。
 3. 人工标注 Perception/Planner/Proactive 正确答案。
 4. 分模块计算 accuracy、calibration、fallback、disagreement 和实际延迟。
 5. 按模块拆分 threshold，而不是继续使用全局 0.85／0.80；评估不同模块置信度是否可比较。
-6. 为 429/529 增加总超时受控的有限重试和 circuit breaker。
-7. 持久化 Decision Metrics。
-8. 验证后优先只把 Planner 切到 hybrid。
+6. 根据真实错误率决定是否为 429/529 增加总超时受控的有限重试和 circuit breaker；重试也可能增加延迟与费用。
+7. Decision Metrics 已在 v0.8.4 持久化，后续可补模型/模式分组、阶段耗时和分位数；不能把现有累计指标直接作为评估集。
+8. 验证后再考虑先对 Planner 单独试用 hybrid；当前模式开关是全局的，按模块启用仍需补配置与测试。
 9. 再决定是继续纯本地 Memory，还是重新实现 TencentDB Adapter。
 
 如果下一阶段仍按此前路线，应先讨论而不是直接实现：
@@ -1121,7 +1136,7 @@ OK
 1. 阅读 `HANDOFF.md` 和 `README.md`。
 2. 检查当前目录树和 `metadata.yaml`。
 3. 检查最近文件改动，不假设本文档之后没有变化。
-4. 运行当前全量回归测试；v0.8.3 模型回退修复后于 2026-10-11 全量 225 项通过，此前 2026-09-30 为 209 项，v0.8.2 为 195 项，v0.8.1 为 184 项，v0.8.0 为 155 项，v0.7.0 为 122 项。
+4. 运行当前全量回归测试；v0.8.4 于 2026-10-11 全量 238 项通过，模型回退修复后的 225 项及更早结果为历史基线。
 5. 检查 `alice_agent/` 是否仍无 AstrBot/HTTP infrastructure import。
 6. 如果要改 AstrBot Adapter，重新核对当前安装版本和官方插件 API。
 7. 如果要改 Jev Adapter，重新核对 TypeSafe 官方 API/OpenAPI 和 model list。
@@ -1145,7 +1160,7 @@ C:\Users\Administrator\.astrbot\data\plugins\astrbot_plugin_alice_agent
 - _conf_schema.json
 - 当前 tests
 
-当前版本为 v0.8.3。
+当前版本为 v0.8.4。
 
 重要事实：
 - Memory 当前是纯本地 SQLite，不存在 TencentDB/MemoryCore Adapter。
@@ -1155,10 +1170,14 @@ C:\Users\Administrator\.astrbot\data\plugins\astrbot_plugin_alice_agent
 - Reactive Media 已接入但 schema 默认 media_enabled=false；2026-09-29 核对的当前实例 `media_enabled=true`、`media_emoji_enabled=true`。主动文本消息默认分段发送。
 - 本地语义 VAD 默认开启；Jev 可用时回复情绪始终混合 Jev 与本地 VAD，即使在 shadow；但 shadow 的分类、时机和媒体选择仍为原路径。时机模块在 Jev 可用时会产生观察请求，并受 3 秒首条硬期限约束。
 - 逐轮诊断 JSON 默认关闭；启用会保存私聊文本及情绪/模型参数。
+- TTS 私聊原文/译文日志默认关闭，需显式开启 media_log_tts_inputs；test_log_retention_days 默认 0 不清理旧诊断。
+- Decision Metrics 默认持久化至 alice_metrics.db，每 30 秒及正常卸载保存，只有按任务类型累计的汇总，不包含私聊文本或用户标识。
+- 持续 Tick 按最后一次用户交互计算闲置，补齐休息状态进入/退出；valence 在每日事件关闭时也逐步回归基线。
 - 每日事件默认关闭；启用后按会话每天生成少量事件并持久化心境，可能增加 LLM/Jev 调用。
 - 会话连续性默认开启：历史按 session 恢复最多最近 `history_limit` 轮，默认 8 轮／72 小时；关闭后不读写近期历史快照。心境即使每日事件关闭也可持久化。保存的是发送确认路径交给 AstrBot 的实际文本，包括主动消息；平台最终送达仍未知。
 - alice_agent/ Core 不允许依赖 AstrBot 或 TypeSafe HTTP。
-- v0.8.3 于 2026-09-30 全量 209 项通过，源码编译和配置 schema 解析通过；v0.8.2 为 195 项，v0.8.1 为 184 项，v0.8.0 为 155 项，v0.7.0 为 122 项。新测试通过临时真实 SQLite 重建插件实例和模拟 AstrBot 分段发送取消，验证上文／心境恢复及实际交付边界；模型与平台仍使用 mock/fake。此前本机 Genie 的角色加载、参考音频设置、TTS 均返回 200（TTS 返回非空原始 PCM），并完成一次实际 Renderer 合成 WAV→QQ 官方 Record→Silk 的本地贯通验证；翻译在该 smoke 中使用固定日文文本，未做真实 QQ API 送达测试。2026-09-29 只读核对配置时 `media_enabled=true`、`media_voice_enabled=true`、`media_emoji_enabled=true`、`test_log_enabled=true`；这些是实例值，不代表默认值。
+- v0.8.4 于 2026-10-11 全量 238 项、源码编译和配置 schema 解析通过；新增测试覆盖连续 Tick 的休息闭环、真实临时 SQLite 指标恢复、存储故障及卸载竞态、诊断保留和 TTS 日志开关。v0.8.3 的 209/225 项为历史基线；模型与平台仍使用 mock/fake，未重载生产实例。
+- 历史媒体验证：此前本机 Genie 的角色加载、参考音频设置、TTS 均返回 200（TTS 返回非空原始 PCM），并完成一次实际 Renderer 合成 WAV→QQ 官方 Record→Silk 的本地贯通验证；翻译在该 smoke 中使用固定日文文本，未做真实 QQ API 送达测试。2026-09-29 历史配置为 `media_enabled=true`、`media_voice_enabled=true`、`media_emoji_enabled=true`、`test_log_enabled=true`；这些不是默认值，也不能视为当前已复核值。
 
 开始修改前：
 1. 审查当前真实代码，不根据旧对话猜测。
@@ -1184,4 +1203,4 @@ Reactive Pipeline
 + Optional reactive TTS / emoji media output
 ```
 
-它尚未完成的主要不是“再加一个 Prompt”，而是生产验证：每日事件的实际表现与费用、真实 QQ 长期运行、Jev 中文 shadow 校准、真实 Genie/QQ 播放验收、指标持久化、时间事件提取，以及未来 Desktop Gateway。后续开发必须继续保持 Core 与 AstrBot、Memory Backend、Decision Backend 和媒体 I/O 的可替换边界。
+后续重点是生产验证：每日事件的实际表现与费用、真实 QQ 长期运行、Jev 中文校准、真实 Genie/QQ 播放验收，以及指标分组与时间事件提取。休息状态规则、指标持久化和日志治理已在 v0.8.4 完成本地验证，仍需观察真实长期表现。后续开发必须继续保持 Core 与 AstrBot、Memory Backend、Decision Backend 和媒体 I/O 的可替换边界。

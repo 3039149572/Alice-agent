@@ -271,6 +271,7 @@ def _build_media_config(config: dict) -> MediaConfig:
         send_text_with_audio=bool(configured_value("media_send_text_with_audio", "send_text_with_audio", True)),
         tts_max_chars=int(configured_value("media_tts_max_chars", "tts_max_chars", 80)),
         emoji_delay_seconds=float(config.get("media_emoji_delay", 0.5)),
+        log_tts_inputs=bool(config.get("media_log_tts_inputs", False)),
     )
 
 
@@ -312,6 +313,15 @@ class AliceAgentPlugin(Star):
             self.logger.warning(
                 "Jev is enabled but no API key is configured; existing decision paths remain active"
             )
+        data_dir = StarTools.get_data_dir("astrbot_plugin_alice_agent")
+        metrics_storage = None
+        if bool(raw_config.get("decision_metrics_persistence_enabled", True)):
+            try:
+                metrics_storage = SQLiteStorageAdapter(data_dir / "alice_metrics.db")
+            except Exception as exc:
+                self.logger.warning(
+                    f"Alice decision metrics SQLite unavailable ({type(exc).__name__})"
+                )
         decision_service = DecisionService(
             decision_port,
             mode=decision_mode,
@@ -321,8 +331,8 @@ class AliceAgentPlugin(Star):
                 review_threshold=self._config.jev_review_threshold,
             ),
             logger=self.logger,
+            metrics_storage=metrics_storage,
         )
-        data_dir = StarTools.get_data_dir("astrbot_plugin_alice_agent")
         self._test_logger = AtomicJSONTurnLogger(data_dir / "test_turns")
         self._send_coordinator = SessionSendCoordinator()
         self._pending_replies = PendingReplyCoordinator()
@@ -581,6 +591,7 @@ class AliceAgentPlugin(Star):
         self._media_initialized = False
 
     async def initialize(self) -> None:
+        await self._decision_service.start()
         if not self._media_initialized:
             await self._media_renderer.initialize()
             self._media_initialized = True
@@ -659,6 +670,9 @@ class AliceAgentPlugin(Star):
                 record,
                 enabled=lambda: self._test_logging_active
                 and bool(self._raw_config.get("test_log_enabled", False)),
+                retention_days=min(3650, max(0, int(_finite_float(
+                    self._raw_config.get("test_log_retention_days", 0), 0.0
+                )))),
             )
         except Exception:
             self.logger.exception(

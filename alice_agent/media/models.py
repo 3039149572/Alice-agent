@@ -62,6 +62,7 @@ class MediaConfig:
     send_text_with_audio: bool = True
     tts_max_chars: int = 80
     emoji_delay_seconds: float = 0.5
+    log_tts_inputs: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "min_chars", max(1, int(self.min_chars)))

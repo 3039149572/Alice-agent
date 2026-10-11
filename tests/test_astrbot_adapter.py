@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from astrbot_plugin_alice_agent.adapters.astrbot.llm_adapter import AstrBotLLMAdapter
 from astrbot_plugin_alice_agent.adapters.astrbot.message_adapter import AstrBotMessageAdapter
@@ -115,6 +116,13 @@ class FakeMediaRenderer:
 
 
 class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        data_dir_patch = patch.object(plugin_main.StarTools, "get_data_dir", return_value=Path(temporary.name))
+        data_dir_patch.start()
+        self.addCleanup(data_dir_patch.stop)
+
     async def test_plugin_initialize_and_terminate_manage_single_loop(self) -> None:
         plugin = AliceAgentPlugin(
             FakeContext(), {"memory_enabled": False, "memory_backend": "in_memory", "vad_enabled": False,

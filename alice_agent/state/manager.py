@@ -54,9 +54,15 @@ class StateManager:
     async def commit_update(self, session_id: str, state: AgentState) -> None:
         await self._storage.set(self._NAMESPACE, session_id, asdict(state))
 
-    async def advance_time(self, session_id: str, elapsed_seconds: float) -> AgentState:
+    async def advance_time(
+        self, session_id: str, elapsed_seconds: float, *,
+        inactivity_seconds: float | None = None, rest_need: float = 0.0,
+    ) -> AgentState:
         old_state = await self.get(session_id)
-        new_state = self._time_reducer.reduce(old_state, elapsed_seconds)
+        new_state = self._time_reducer.reduce(
+            old_state, elapsed_seconds,
+            inactivity_seconds=inactivity_seconds, rest_need=rest_need,
+        )
         await self._storage.set(self._NAMESPACE, session_id, asdict(new_state))
         return new_state
 

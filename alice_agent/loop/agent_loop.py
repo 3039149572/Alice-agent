@@ -224,7 +224,14 @@ class AgentLoop:
                         daily_events = [item for item in events if isinstance(item, dict)]
                 except Exception:
                     self._logger.exception("Alice daily event tick failed safely")
-            state = await self._states.advance_time(session_id, elapsed)
+            previous_drives = await self._drives.get(session_id, user_id)
+            state = await self._states.advance_time(
+                session_id, elapsed,
+                inactivity_seconds=(
+                    max(0.0, now - last_interaction) if last_interaction is not None else None
+                ),
+                rest_need=previous_drives.rest_need if self._config.drive_rest_enabled else 0.0,
+            )
             relationship = await self._relationships.get(user_id)
             drives = await self._drives.advance(
                 session_id, user_id, now, state, relationship,
