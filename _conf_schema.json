@@ -1,0 +1,390 @@
+{
+  "enabled": {
+    "description": "启用 Alice Agent",
+    "type": "bool",
+    "default": true
+  },
+  "debug": {
+    "description": "详细 Pipeline 调试日志",
+    "type": "bool",
+    "default": false
+  },
+  "test_log_enabled": {
+    "description": "测试模式：逐轮保存私聊文本与情绪/模型诊断 JSON；关闭后停止新增记录",
+    "type": "bool",
+    "default": false,
+    "hint": "日志保存在插件数据目录 test_turns/。记录包含完整用户与 Alice 回复文本，请按本机隐私要求保管；关闭不会删除旧记录。"
+  },
+  "daily_events_enabled": {
+    "description": "启用按会话隔离的每日小事件和持久化心境",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每天首次检查最多生成设定数量的小事件；可能调用当前会话模型和 Jev，并保存事件与情绪到 alice_mood.db。"
+  },
+  "response_timing_enabled": {
+    "description": "启用回复时机本地规则及 Jev 有界判断；全局 Jev off 时只使用本地规则",
+    "type": "bool",
+    "default": true
+  },
+  "response_wait_quiet_seconds": {
+    "description": "明确表示还要继续时，等待后续消息的安静时间（秒）",
+    "type": "float",
+    "default": 0.8
+  },
+  "response_wait_max_seconds": {
+    "description": "一组消息从首条起的最大等待时间（秒），不会因新消息无限延长",
+    "type": "float",
+    "default": 3.0
+  },
+  "persona_profile": {
+    "description": "Alice 的可编辑虚构日常背景、兴趣、作息和每日事件种子（JSON）",
+    "type": "string",
+    "default": "{\"name\":\"Alice\",\"life_background\":\"这是明确虚构的普通生活设定，不对应现实中的位置、日程或传感器状态：Alice住在一个不指明城市和季节的普通居住环境里，有一张常用的小书桌，用来读写、整理便签和放手边的小物件。她的生活以普通琐事和安静兴趣为主，日子大多平稳，偶尔被小事打断后会重新安排。\",\"interests\":[\"短篇阅读\",\"音乐\",\"简单点心\",\"随手记下的问题\",\"整理小物件\"],\"daily_rhythm\":[\"开始一天时通常先处理一件轻量小事，再逐渐进入状态。\",\"忙碌时会留一点短暂休息；空下来时偏好读几页或听点音乐。\",\"日程偶尔会被琐事打断，她一般通过重新排序来调整。\"],\"daily_event_seeds\":{}}",
+    "hint": "只填写角色虚构设定，不代表用户或现实传感器信息。字段：name、life_background、interests、daily_rhythm、daily_event_seeds。"
+  },
+  "daily_event_max": {
+    "description": "每天每会话最多生成的事件数（0～3）",
+    "type": "int",
+    "default": 2
+  },
+  "daily_event_llm_enabled": {
+    "description": "用当前会话模型扩写每日事件；关闭时使用内置小事件文本",
+    "type": "bool",
+    "default": true
+  },
+  "daily_event_jev_enabled": {
+    "description": "允许 Jev 评估事件对 Alice 的主观情绪影响；遵守全局 Jev 模式",
+    "type": "bool",
+    "default": true
+  },
+  "segmented_send_enabled": {
+    "description": "将回复和主动消息按完整句子分段发送",
+    "type": "bool",
+    "default": true
+  },
+  "segmented_send_max_chars": {
+    "description": "兼容旧配置；整句发送不会按字符数截断句子或代码块",
+    "type": "int",
+    "default": 120
+  },
+  "segmented_send_interval_seconds": {
+    "description": "同一回复各分段之间的发送间隔（秒）",
+    "type": "float",
+    "default": 1.0
+  },
+  "llm_timeout": {
+    "description": "单次 LLM 调用超时（秒）",
+    "type": "float",
+    "default": 30.0
+  },
+  "perception_enabled": {
+    "description": "启用 Perception LLM 阶段",
+    "type": "bool",
+    "default": true
+  },
+  "planner_enabled": {
+    "description": "启用 Planner LLM 阶段",
+    "type": "bool",
+    "default": true
+  },
+  "memory_enabled": {
+    "description": "启用本地记忆召回与观察",
+    "type": "bool",
+    "default": true
+  },
+  "memory_metadata_enabled": {
+    "description": "启用 Alice 本地 Memory Metadata",
+    "type": "bool",
+    "default": true
+  },
+  "memory_backend": {
+    "description": "记忆后端（当前仅支持纯本地 SQLite）",
+    "type": "string",
+    "options": ["local_sqlite"],
+    "labels": ["本地 SQLite 持久记忆"],
+    "default": "local_sqlite"
+  },
+  "history_limit": {
+    "description": "每个会话保留的近期对话轮次数",
+    "type": "int",
+    "default": 8
+  },
+  "session_persistence_enabled": {
+    "description": "在插件重载后恢复近期会话对话和心境",
+    "type": "bool",
+    "default": true,
+    "hint": "对话保存在本机 alice_sessions.db；关闭后不读取或新增对话快照，不删除已有文件。"
+  },
+  "history_restore_max_age_hours": {
+    "description": "恢复会话对话的最长时间范围（1～168 小时）",
+    "type": "float",
+    "default": 72.0,
+    "hint": "超出时间范围的对话不会进入上下文；已沉睡会话的旧数据库行不会被全局清理。"
+  },
+  "memory_recall_limit": {
+    "description": "Rerank 后最多交给 Planner 的长期记忆数",
+    "type": "int",
+    "default": 5
+  },
+  "memory_selected_limit": {
+    "description": "Planner 最多可交给 Response Generator 的记忆数",
+    "type": "int",
+    "default": 3
+  },
+  "memory_importance_threshold": {
+    "description": "进入本地长期记忆的最低重要度",
+    "type": "float",
+    "default": 0.6
+  },
+  "memory_min_relevance": {
+    "description": "Alice Reranker 的硬相关性门槛",
+    "type": "float",
+    "default": 0.12
+  },
+  "memory_semantic_weight": {
+    "description": "Rerank 检索相关度权重",
+    "type": "float",
+    "default": 0.65
+  },
+  "memory_importance_weight": {
+    "description": "Rerank 长期重要度权重",
+    "type": "float",
+    "default": 0.15
+  },
+  "memory_emotion_weight": {
+    "description": "Rerank 情绪意义权重",
+    "type": "float",
+    "default": 0.07
+  },
+  "memory_relationship_weight": {
+    "description": "Rerank 关系意义权重",
+    "type": "float",
+    "default": 0.08
+  },
+  "memory_recency_weight": {
+    "description": "Rerank 时间新近度权重",
+    "type": "float",
+    "default": 0.05
+  },
+  "relationship_enabled": {
+    "description": "启用长期 Relationship Engine",
+    "type": "bool",
+    "default": true
+  },
+  "relationship_max_delta_per_turn": {
+    "description": "关系数值单轮最大变化量",
+    "type": "float",
+    "default": 0.02
+  },
+  "local_memory_scope": {
+    "description": "本地长期记忆隔离范围",
+    "type": "string",
+    "options": ["user", "session"],
+    "labels": ["按用户（可跨会话召回）", "按会话（完全隔离）"],
+    "default": "user",
+    "hint": "状态始终按 session 隔离；这里只决定长期记忆能否在同一用户的不同会话间召回。"
+  },
+  "local_memory_capture_all_turns": {
+    "description": "在本地记录所有完成的对话轮次",
+    "type": "bool",
+    "default": true,
+    "hint": "原始轮次只写入本机 SQLite 日志表；只有通过重要度门控的候选才会进入可召回长期记忆。"
+  },
+  "local_memory_candidate_limit": {
+    "description": "单次本地相关度计算最多读取的候选数",
+    "type": "int",
+    "default": 300
+  },
+  "local_memory_busy_timeout": {
+    "description": "SQLite 遇到数据库锁时最多等待秒数",
+    "type": "float",
+    "default": 5.0
+  },
+  "local_memory_path": {
+    "description": "自定义本地 SQLite 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空时使用 AstrBot/data/plugin_data/astrbot_plugin_alice_agent/alice_memory.db。建议留空。"
+  },
+  "agent_loop_enabled": {
+    "description": "启用 Alice 事件驱动后台循环",
+    "type": "bool",
+    "default": true
+  },
+  "agent_tick_interval": {
+    "description": "后台轻量 Tick 间隔（秒）",
+    "type": "float",
+    "default": 30.0
+  },
+  "drive_social_enabled": {"description": "启用 social_need", "type": "bool", "default": true},
+  "drive_curiosity_enabled": {"description": "启用 curiosity", "type": "bool", "default": true},
+  "drive_rest_enabled": {"description": "启用 rest_need", "type": "bool", "default": true},
+  "drive_social_growth_per_hour": {"description": "social_need 每小时基础增长", "type": "float", "default": 0.025},
+  "drive_curiosity_growth_per_hour": {"description": "存在未完成上下文时 curiosity 每小时基础增长", "type": "float", "default": 0.035},
+  "drive_rest_growth_per_hour": {"description": "非休息状态下 rest_need 每小时基础增长", "type": "float", "default": 0.04},
+  "proactive_enabled": {
+    "description": "允许高门槛主动消息（关闭时仍更新内部状态）",
+    "type": "bool",
+    "default": true
+  },
+  "proactive_score_threshold": {"description": "主动行为高门槛", "type": "float", "default": 0.72},
+  "proactive_daily_score_threshold": {"description": "每日生活分享候选的专用评分门槛（0–1）", "type": "float", "default": 0.45},
+  "proactive_defer_threshold": {"description": "主动行为延后门槛", "type": "float", "default": 0.60},
+  "proactive_min_interval": {"description": "全局及单用户主动消息最短间隔（秒）", "type": "float", "default": 21600.0},
+  "proactive_same_topic_interval": {"description": "同话题主动消息最短间隔（秒）", "type": "float", "default": 86400.0},
+  "proactive_daily_budget": {"description": "每用户每日主动消息上限", "type": "int", "default": 1},
+  "proactive_window_start": {"description": "主动消息本地允许时段开始（HH:MM）", "type": "string", "default": "09:00"},
+  "proactive_window_end": {"description": "主动消息本地允许时段结束（HH:MM）", "type": "string", "default": "21:00"},
+  "proactive_daily_attempt_limit": {"description": "每日事件主动分享每天尝试上限", "type": "int", "default": 2},
+  "active_conversation_window": {"description": "用户活跃对话保护窗口（秒）", "type": "float", "default": 900.0},
+  "planner_timeout": {"description": "主动 Planner 超时（秒）", "type": "float", "default": 20.0},
+  "proactive_social_weight": {"description": "主动评分 social_need 权重", "type": "float", "default": 0.18},
+  "proactive_curiosity_weight": {"description": "主动评分 curiosity 权重", "type": "float", "default": 0.24},
+  "proactive_relationship_weight": {"description": "主动评分 Relationship 权重", "type": "float", "default": 0.15},
+  "proactive_relevance_weight": {"description": "主动评分上下文相关性权重", "type": "float", "default": 0.55},
+  "proactive_urgency_weight": {"description": "主动评分时间紧迫度权重", "type": "float", "default": 0.20},
+  "proactive_interruption_weight": {"description": "主动评分打扰成本扣分权重", "type": "float", "default": 0.15},
+  "proactive_rest_weight": {"description": "主动评分 rest_need 扣分权重", "type": "float", "default": 0.08},
+  "jev_enabled": {
+    "description": "启用 Jev Decision Layer；无 API Key 时自动保留原决策路径",
+    "type": "bool",
+    "default": false
+  },
+  "jev_mode": {
+    "description": "Jev 工作模式；首次启用推荐 shadow",
+    "type": "string",
+    "options": ["off", "shadow", "hybrid", "primary"],
+    "labels": ["关闭", "影子比较", "高置信度接管", "Jev 优先"],
+    "default": "shadow"
+  },
+  "jev_endpoint": {
+    "description": "TypeSafe System One 完整 endpoint",
+    "type": "string",
+    "default": "https://api.typesafe.ai/v1/systemone"
+  },
+  "jev_api_key": {
+    "description": "TypeSafe API Key（也可使用 TYPESAFE_API_KEY 或 JEV_API_KEY 环境变量）",
+    "type": "string",
+    "password": true,
+    "obvious_hint": true,
+    "default": "",
+    "hint": "不会写入源码或日志。推荐通过运行环境注入。"
+  },
+  "jev_model": {
+    "description": "Jev model ID 或 alias",
+    "type": "string",
+    "default": "jev-latest"
+  },
+  "jev_timeout_ms": {
+    "description": "Jev 单次请求超时（毫秒）",
+    "type": "int",
+    "default": 2500
+  },
+  "jev_auto_threshold": {
+    "description": "Jev 自动采用决策的高置信度门槛",
+    "type": "float",
+    "default": 0.85
+  },
+  "jev_review_threshold": {
+    "description": "Jev 决策最低采用置信度；实际下限固定为 0.80。有对应 LLM 路径时低于下限回退；有双路数值时先混合",
+    "type": "float",
+    "default": 0.80
+  },
+  "vad_enabled": {
+    "description": "使用本地 VAD 模型作为用户情绪基线；不可用时回退现有 Perception",
+    "type": "bool",
+    "default": true
+  },
+  "vad_endpoint": {
+    "description": "本地 VAD 服务基础地址",
+    "type": "string",
+    "default": "http://127.0.0.1:8001"
+  },
+  "vad_timeout_ms": {
+    "description": "本地 VAD 单次请求超时（毫秒）",
+    "type": "int",
+    "default": 5000
+  },
+  "jev_vad_weight": {
+    "description": "最终情绪混合中 Jev（低置信度先融合 LLM）相对本地 VAD 的权重；默认两者各半",
+    "type": "float",
+    "default": 0.5
+  },
+  "jev_perception_enabled": {"description": "Jev 参与 Perception bounded decisions", "type": "bool", "default": true},
+  "jev_memory_enabled": {"description": "Jev 辅助候选 Memory relevance", "type": "bool", "default": true},
+  "jev_planner_enabled": {"description": "Jev 参与 Planner bounded choices", "type": "bool", "default": true},
+  "jev_proactive_enabled": {"description": "Jev 参与 Proactive Gate", "type": "bool", "default": true},
+  "jev_media_enabled": {"description": "Jev 参与语音/表情包有界决策；仅在全局 Jev 启用时生效", "type": "bool", "default": true},
+  "jev_memory_relevance_blend": {
+    "description": "通过代码公式混合 Jev relevance 的比例",
+    "type": "float",
+    "default": 0.25
+  },
+  "media_enabled": {
+    "description": "启用 Alice 回复的可选语音和表情包输出",
+    "type": "bool",
+    "default": true,
+    "hint": "默认关闭，避免在未配置 Genie 或仍启用旧插件时重复发送。开启后可直接复用同级 deeplx_genie_tts 的现有索引和素材。"
+  },
+  "media_voice_enabled": {"description": "允许 Genie TTS 语音", "type": "bool", "default": true},
+  "media_emoji_enabled": {"description": "允许发送本地表情包", "type": "bool", "default": true},
+  "media_min_chars": {"description": "触发媒体决策的最短回复字符数", "type": "int", "default": 10},
+  "media_cooldown": {"description": "同一会话两次媒体触发的最短间隔（秒）", "type": "float", "default": 0.0},
+  "media_voice_probability": {"description": "通过规则门槛后尝试语音的概率（0~1）", "type": "float", "default": 1.0},
+  "media_emoji_probability": {"description": "通过规则门槛后尝试表情包的概率（0~1）", "type": "float", "default": 1.0},
+  "media_candidate_limit": {"description": "每类最多交给 Jev 判断的本地候选数", "type": "int", "default": 5},
+  "media_audio_score_threshold": {"description": "本地参考音频候选最低分", "type": "float", "default": 0.3},
+  "media_emoji_score_threshold": {"description": "本地表情包候选最低分", "type": "float", "default": 0.3},
+  "media_audio_index_path": {
+    "description": "参考音频索引 JSON 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动查找同级 deeplx_genie_tts/audio_index.json。"
+  },
+  "media_emoji_index_path": {
+    "description": "表情包索引 JSON 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动查找同级 deeplx_genie_tts/emoji_index.json。"
+  },
+  "media_audio_dir": {
+    "description": "参考音频素材目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动查找同级 deeplx_genie_tts/audio。"
+  },
+  "media_emoji_dir": {
+    "description": "表情包图片目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动查找同级 deeplx_genie_tts/images。"
+  },
+  "media_genie_host": {"description": "Genie TTS 服务 IP", "type": "string", "default": "localhost"},
+  "media_genie_port": {"description": "Genie TTS 服务端口", "type": "int", "default": 8000},
+  "media_character_name": {"description": "Genie TTS 角色名称", "type": "string", "default": ""},
+  "media_onnx_model_dir": {"description": "Genie TTS ONNX 模型目录", "type": "string", "default": ""},
+  "media_tts_language": {
+    "description": "TTS 目标语言",
+    "type": "string",
+    "options": ["chinese", "english", "japanese"],
+    "labels": ["中文", "英文", "日文"],
+    "default": "japanese"
+  },
+  "media_deepl_api_key": {
+    "description": "DeepL 官方 API 密钥（TTS 翻译优先使用；留空则使用默认模型）",
+    "type": "string",
+    "default": "",
+    "password": true,
+    "hint": "也可设置 DEEPL_API_KEY 环境变量。Free 密钥以 :fx 结尾；DeepL 失败时自动回退当前会话模型。"
+  },
+  "media_default_ref_audio": {"description": "默认参考音频路径", "type": "string", "default": ""},
+  "media_default_ref_text": {"description": "默认参考音频对应文本", "type": "text", "default": ""},
+  "media_send_text_with_audio": {"description": "发送语音时同时保留文本", "type": "bool", "default": true},
+  "media_tts_max_chars": {"description": "送入 TTS 的最大字符数", "type": "int", "default": 80},
+  "media_emoji_delay": {"description": "文本/语音发送后延迟发送表情包的秒数", "type": "float", "default": 0.5},
+  "fallback_text": {
+    "description": "最终回复生成失败时发送的友好提示",
+    "type": "string",
+    "default": "抱歉，我刚刚没能组织好回应。可以再说一遍吗？"
+  }
+}

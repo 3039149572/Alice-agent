@@ -1,0 +1,37 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Credentials, instance configuration, state and diagnostics
+.env
+.env.*
+!.env.example
+data/
+plugin_data/
+test_turns/
+*.db
+*.db-*
+*.sqlite*
+*.log
+*_config.json
+
+# Local media libraries are deployed separately from source updates
+/audio/
+/images/
+/audio_index.json
+/emoji_index.json
+*.npy
+
+# Generated packages and backups
+*.zip
+*.bak
+*.backup
+dist/
+build/

@@ -1,0 +1,13 @@
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+
+class StoragePort(Protocol):
+    async def get(self, namespace: str, key: str) -> Any | None: ...
+
+    async def set(self, namespace: str, key: str, value: Any) -> None: ...
+
+    async def delete(self, namespace: str, key: str) -> None: ...
+
+    async def close(self) -> None: ...
