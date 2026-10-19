@@ -12,6 +12,7 @@ from ..decision.schemas import DAILY_EVENT_SCHEMA, daily_event_questions
 from ..domain.history import ConversationTurn
 from ..domain.llm import LLMRequest
 from ..persona.profile import coerce_persona_profile
+from ..knowledge.novel import has_childhood_recollection
 from ..perception.parser import parse_json_object
 from ..ports.logging import LoggerPort, NullLogger
 
@@ -213,6 +214,7 @@ class DailyEventService:
             or any(word in text for word in _UNSAFE_STORY_WORDS)
             or text.startswith(("{", "[", "#", "-", "```"))
             or not any(anchor in text for anchor in _CATEGORY_ANCHORS[category])
+            or has_childhood_recollection(text)
         ):
             return fallback
         return text

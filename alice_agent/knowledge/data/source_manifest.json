@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "archive": "爱丽丝LLM上下文资料包_全章覆盖版.zip",
+  "archive_sha256": "a9e932fc858c2db4346d4fc37f461959998391a9e9f8b5ee5642b935389037f2",
+  "original_novel_sha256": "413e5c4e7687bd5ccb70127100dca1d84d43765091301e45763289d2d2e32681",
+  "source_member_sha256": {
+    "03_人物对话示例.jsonl": "7e7bcefd31f67e5cce17eec94029b1e253707222782ab46370c2269108466aef",
+    "04_剧情与关系资料.jsonl": "fe029ffb320cf391d25313527efeb518a9a5d4090aa7d1861ef7f9cc49289a6b"
+  },
+  "counts": {
+    "dialogues.jsonl": {
+      "source": 172,
+      "included": 28,
+      "stage_scope": {
+        "integrity_knight": 13,
+        "later_canon": 15
+      },
+      "knowledge_mode": {
+        "interpretation": 28
+      }
+    },
+    "facts.jsonl": {
+      "source": 245,
+      "included": 228,
+      "stage_scope": {
+        "childhood": 44,
+        "integrity_knight": 89,
+        "later_canon": 95
+      },
+      "knowledge_mode": {
+        "reader_background": 105,
+        "self_experience": 120,
+        "reported": 3
+      }
+    }
+  },
+  "default_stage": "integrity_knight",
+  "selection": [
+    "只收正传中人工筛选的具体场景对白；宽泛标签不能让对白入库或触发召回",
+    "剔除童年、执法威胁、不确定及仅有宽泛标签的对白",
+    "剧情卡保留来源知情方式；童年一律只作读者背景",
+    "原著后期资料单列，默认骑士阶段不检索；不导入补篇、全文或运行数据"
+  ],
+  "source_corrections": [
+    {
+      "id": "full-h075440-b004-f01",
+      "evidence_lines": [
+        76952,
+        76966,
+        76980
+      ],
+      "correction": "原标题临终改为冻结术式中的短暂苏醒；保留来源与后来的战死事件区别"
+    }
+  ],
+  "limits": [
+    "input TXT completeness against a published edition",
+    "every utterance exhaustively extracted",
+    "live user-plugin LLM roleplay acceptance"
+  ]
+}

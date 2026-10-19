@@ -22,6 +22,11 @@ test_turns/
 *.log
 *_config.json
 
+# Bundled read-only novel reference data, separate from runtime data/
+!alice_agent/knowledge/data/
+!alice_agent/knowledge/data/*.json
+!alice_agent/knowledge/data/*.jsonl
+
 # Local media libraries are deployed separately from source updates
 /audio/
 /images/

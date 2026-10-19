@@ -93,6 +93,10 @@ class AstrBotProactiveSender:
                 )
                 return ProactiveSendResult(False, delivered, "".join(delivered_text))
             if result is False:
+                self._logger.warning(
+                    f"PROACTIVE sender_rejected session={session_id}; "
+                    "AstrBot returned False: check platform/session routing and adapter logs"
+                )
                 return ProactiveSendResult(False, delivered, "".join(delivered_text))
             delivered += 1
             delivered_text.append(chunk)

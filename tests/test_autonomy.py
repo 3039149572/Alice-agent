@@ -23,6 +23,7 @@ from astrbot_plugin_alice_agent.alice_agent.loop.store import InMemoryAutonomySt
 from astrbot_plugin_alice_agent.alice_agent.ports.logging import NullLogger
 from astrbot_plugin_alice_agent.alice_agent.ports.proactive import ProactiveSendResult
 from astrbot_plugin_alice_agent.alice_agent.proactive.cooldown import CooldownConfig, CooldownManager
+from astrbot_plugin_alice_agent.alice_agent.proactive.daily_policy import DailyProactivePolicy
 from astrbot_plugin_alice_agent.alice_agent.proactive.evaluator import ProactiveEvaluator
 from astrbot_plugin_alice_agent.alice_agent.proactive.models import (
     ActionStatus, CandidateAction, CandidateActionType, ProactiveActionPlan,
@@ -174,6 +175,7 @@ def build_loop(clock: FakeClock, *, daily_budget: int = 2, active_window: float 
         scheduler=ContextScheduler(store),
         drive_manager=DriveManager(store, DriveReducer()),
         state_manager=StateManager(InMemoryStorageAdapter(), StateReducer(), TimeStateReducer()),
+        daily_policy=DailyProactivePolicy(store, random_value=lambda: 0.0),
         relationship_manager=relationship, memory=FakeMemory(),
         proactive_planner=planner, response_generator=FakeResponses(),
         scorer=ActionScorer(ActionScoreConfig(threshold=0.0, defer_threshold=0.0)),

@@ -18,6 +18,12 @@ class AgentConfig:
     history_limit: int = 8
     session_persistence_enabled: bool = True
     history_restore_max_age_hours: float = 72.0
+    novel_context_enabled: bool = True
+    novel_context_dir: str = ""
+    novel_context_stage: str = "integrity_knight"
+    novel_fact_limit: int = 3
+    novel_dialogue_limit: int = 3
+    novel_context_max_chars: int = 6000
     memory_recall_limit: int = 5
     memory_selected_limit: int = 3
     memory_importance_threshold: float = 0.6
@@ -47,7 +53,9 @@ class AgentConfig:
     drive_rest_growth_per_hour: float = 0.04
     proactive_enabled: bool = True
     proactive_score_threshold: float = 0.72
-    proactive_daily_score_threshold: float = 0.45
+    proactive_daily_score_threshold: float = 0.35
+    proactive_daily_probability: float = 0.55
+    proactive_daily_probability_llm_enabled: bool = True
     proactive_defer_threshold: float = 0.60
     proactive_min_interval: float = 21600.0
     proactive_same_topic_interval: float = 86400.0
@@ -80,6 +88,15 @@ class AgentConfig:
     fallback_text: str = "抱歉，我刚刚没能组织好回应。可以再说一遍吗？"
 
     def __post_init__(self) -> None:
+        from .knowledge.novel import NovelContextConfig
+        novel = NovelContextConfig(
+            stage=self.novel_context_stage, fact_limit=self.novel_fact_limit,
+            dialogue_limit=self.novel_dialogue_limit, max_chars=self.novel_context_max_chars,
+        )
+        object.__setattr__(self, "novel_context_stage", novel.stage)
+        object.__setattr__(self, "novel_fact_limit", novel.fact_limit)
+        object.__setattr__(self, "novel_dialogue_limit", novel.dialogue_limit)
+        object.__setattr__(self, "novel_context_max_chars", novel.max_chars)
         object.__setattr__(self, "llm_timeout", max(1.0, float(self.llm_timeout)))
         object.__setattr__(self, "history_limit", max(0, int(self.history_limit)))
         object.__setattr__(self, "session_persistence_enabled", bool(self.session_persistence_enabled))
@@ -125,6 +142,7 @@ class AgentConfig:
             "drive_social_growth_per_hour", "drive_curiosity_growth_per_hour",
             "drive_rest_growth_per_hour", "proactive_score_threshold",
             "proactive_daily_score_threshold",
+            "proactive_daily_probability",
             "proactive_defer_threshold", "proactive_social_weight",
             "proactive_curiosity_weight", "proactive_relationship_weight",
             "proactive_relevance_weight", "proactive_interruption_weight",

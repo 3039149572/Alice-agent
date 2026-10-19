@@ -34,6 +34,7 @@ from .alice_agent.core.agent import AliceAgent
 from .alice_agent.core.pipeline import AgentPipeline
 from .alice_agent.core.session_manager import SessionManager
 from .alice_agent.generation.context_builder import ContextBuilder
+from .alice_agent.knowledge import NovelContextConfig
 from .alice_agent.generation.response_generator import ResponseGenerator
 from .alice_agent.llm.service import LLMService
 from .alice_agent.memory.manager import MemoryManager
@@ -64,6 +65,7 @@ from .alice_agent.drives.manager import DriveManager
 from .alice_agent.drives.reducer import DriveReducer, DriveReducerConfig
 from .alice_agent.events.bus import EventBus
 from .alice_agent.loop.agent_loop import AgentLoop
+from .alice_agent.proactive.daily_policy import DailyProactivePolicy
 from .alice_agent.loop.lifecycle import SystemClock
 from .alice_agent.loop.scheduler import ContextScheduler
 from .alice_agent.loop.store import InMemoryAutonomyStore, SQLiteAutonomyStore
@@ -145,6 +147,12 @@ def _build_config(config: dict) -> AgentConfig:
         history_restore_max_age_hours=_finite_float(
             config.get("history_restore_max_age_hours"), 72.0
         ),
+        novel_context_enabled=bool(config.get("novel_context_enabled", True)),
+        novel_context_dir=str(config.get("novel_context_dir") or ""),
+        novel_context_stage=str(config.get("novel_context_stage", "integrity_knight")),
+        novel_fact_limit=config.get("novel_fact_limit", 3),
+        novel_dialogue_limit=config.get("novel_dialogue_limit", 3),
+        novel_context_max_chars=config.get("novel_context_max_chars", 6000),
         memory_recall_limit=int(config.get("memory_recall_limit", 5)),
         memory_selected_limit=int(config.get("memory_selected_limit", 3)),
         memory_importance_threshold=float(config.get("memory_importance_threshold", 0.6)),
@@ -176,7 +184,9 @@ def _build_config(config: dict) -> AgentConfig:
         drive_rest_growth_per_hour=float(config.get("drive_rest_growth_per_hour", 0.04)),
         proactive_enabled=bool(config.get("proactive_enabled", True)),
         proactive_score_threshold=float(config.get("proactive_score_threshold", 0.72)),
-        proactive_daily_score_threshold=float(config.get("proactive_daily_score_threshold", 0.45)),
+        proactive_daily_score_threshold=float(config.get("proactive_daily_score_threshold", 0.35)),
+        proactive_daily_probability=_finite_float(config.get("proactive_daily_probability"), 0.55),
+        proactive_daily_probability_llm_enabled=bool(config.get("proactive_daily_probability_llm_enabled", True)),
         proactive_defer_threshold=float(config.get("proactive_defer_threshold", 0.60)),
         proactive_min_interval=float(config.get("proactive_min_interval", 21600.0)),
         proactive_same_topic_interval=float(config.get("proactive_same_topic_interval", 86400.0)),
@@ -296,7 +306,18 @@ class AliceAgentPlugin(Star):
             if self._vad_enabled else None
         )
         llm_service = LLMService(AstrBotLLMAdapter(context), self._config.llm_timeout)
-        context_builder = ContextBuilder(profile=self._config.persona_profile)
+        context_builder = ContextBuilder(
+            profile=self._config.persona_profile,
+            novel_config=NovelContextConfig(
+                enabled=self._config.novel_context_enabled,
+                directory=self._config.novel_context_dir,
+                stage=self._config.novel_context_stage,
+                fact_limit=self._config.novel_fact_limit,
+                dialogue_limit=self._config.novel_dialogue_limit,
+                max_chars=self._config.novel_context_max_chars,
+            ),
+            logger=self.logger,
+        )
         decision_mode = (
             DecisionMode(self._config.jev_mode)
             if self._config.jev_enabled else DecisionMode.OFF
@@ -536,6 +557,12 @@ class AliceAgentPlugin(Star):
             state_manager=state_manager,
             daily_events=daily_events,
             relationship_manager=relationship,
+            daily_policy=DailyProactivePolicy(
+                autonomy_store,
+                llm=llm_service if self._config.proactive_daily_probability_llm_enabled else None,
+                base_probability=self._config.proactive_daily_probability,
+                timeout=self._config.planner_timeout,
+            ),
             memory=memory,
             proactive_planner=ProactivePlanner(
                 llm_service, context_builder, self._config.planner_timeout

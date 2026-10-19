@@ -1,6 +1,6 @@
-# Alice Agent v0.8.4 — Rest Lifecycle and Persistent Decision Metrics
+# Alice Agent v0.9.1 — 每日主动分享与角色知识
 
-Alice Agent 是与 AstrBot 解耦的、状态持续的事件驱动角色 Agent Core。AstrBot 仍只负责平台接入、当前会话 LLM Provider、消息发送和插件生命周期；事件、State、Drive、Relationship、Memory、Planner 与行为克制机制均位于独立 Core。v0.8.4 修复持续 Tick 下的闲置与休息状态闭环，增加决策指标持久化及诊断日志管理；保留 v0.8.3 的重载会话恢复和模型回退。
+Alice Agent 是与 AstrBot 解耦的、状态持续的事件驱动角色 Agent Core。AstrBot 仍只负责平台接入、当前会话 LLM Provider、消息发送和插件生命周期；事件、State、Drive、Relationship、Memory、Planner 与行为克制机制均位于独立 Core。v0.9.1 增加心情与每日事件驱动的主动分享概率，并包含小说角色资料与精选对白的本地检索，默认人格为整合骑士爱丽丝；保留已有的会话恢复、模型回退、休息状态与指标持久化。
 
 > 当前工作区的内容记忆后端是纯本地 SQLite，不存在 TencentDB / MemoryCore Adapter。v0.6 没有伪造或重做远端集成。SharedExperience 已有模型和持久化入口，但尚未自动提取 Autobiographical Memory。
 
@@ -8,7 +8,17 @@ Alice Agent 是与 AstrBot 解耦的、状态持续的事件驱动角色 Agent C
 
 源码仓库：[3039149572/Alice-agent](https://github.com/3039149572/Alice-agent)。服务器安装、迁移和后续更新步骤见 [`SERVER_UPDATE.md`](SERVER_UPDATE.md)。仓库只发布源码，音频、表情素材和实例数据独立保管。
 
-2026-10-11 v0.8.4：全量 238 项本地测试通过，源码编译与配置 schema 解析通过。升级后重载插件生效。版本变化见 [CHANGELOG.md](CHANGELOG.md)。真实 QQ 送达、语音播放和 Jev 中文质量仍需线上验收。
+v0.9.1 包含每日主动概率、发送边界修复及此前未发布的角色知识。安装包见 [GitHub Releases](https://github.com/3039149572/Alice-agent/releases)，更新后需重载插件；旧配置请将日常评分门槛从0.45调为0.35。验证范围与排查步骤见 [主动消息说明](docs/PROACTIVE.md)。版本变化见 [CHANGELOG.md](CHANGELOG.md)；角色质量、真实 QQ 送达及媒体仍需实际验收。
+
+## 角色知识与对白检索
+
+默认爱丽丝是整合骑士人格，没有童年滋贝鲁库的亲历记忆；别人讲述的过去可以了解，不能变成记忆恢复。角色设定、回复表达、Planner 和每日事件提示都保留这一边界。
+
+从用户全章覆盖资料包筛选28条具体场景对白及228张剧情资料卡，按阶段与知情方式使用。默认可检索13条骑士时期对白、89张骑士剧情卡和44张只作背景的童年卡；现实世界与Unital Ring后期资料单列，默认不检索。排除童年、执法威胁、归属不明和仅有宽泛标签的对白，另修正了一处把冻结术式中苏醒误写成“临终”的标题。
+
+“关心、解释、确认、日常聊天”等宽泛 tag 不触发召回。对白必须命中人工审核的具体主题或细粒度触发语，并与本轮 Planner action 兼容；无匹配时不提供示例。每轮最多3张剧情卡与3条对白，总计6000字符。相关资料放入回复模型的 `character_knowledge`，与真实用户记忆分开；不增加模型请求，但增加上下文 token。
+
+配置、来源与复现方式见 [docs/NOVEL_CONTEXT.md](docs/NOVEL_CONTEXT.md)。
 
 ## v0.8.4 运行改进
 
@@ -49,11 +59,11 @@ Genie / Emoji       ResponseGenerator
 
 ## 每日事件与心境
 
-`daily_events_enabled` 默认关闭，以免未确认模型费用和角色行为前自动改变线上对话。开启后，每个会话按机器本地日期最多生成 `daily_event_max` 件小事件（默认上限 2，允许 0～3，部分日期为 0 件）。程序确定事件类别与来源，当前会话模型只负责按人物设定扩写 4～80 字的日常小事；不合规输出或模型失败会回退内置文本。下一天可有限概率延续前一天的小线索；前几天同会话的对话可作为“想起用户说过的话”的资料，但不会凭空断言用户后续状况。没有剑术或 TencentDB 等未在当前项目里确立的设定。
+`daily_events_enabled` 默认关闭，以免未确认模型费用和角色行为前自动改变线上对话。开启后，每个会话按机器本地日期最多生成 `daily_event_max` 件小事件（默认上限 2，允许 0～3，部分日期为 0 件）。程序确定事件类别与来源，当前会话模型只负责按人物设定扩写 4～80 字的日常小事；不合规输出或模型失败会回退内置文本。下一天可有限概率延续前一天的小线索；前几天同会话的对话可作为“想起用户说过的话”的资料，但不会凭空断言用户后续状况。日常种子取自 persona_profile，默认遵循整合骑士设定；不恢复童年记忆。
 
-`persona_profile` 可配置角色姓名、明确虚构的生活背景、兴趣、作息和每日事件种子。该设定会影响日常事件骨架及回复/规划上下文；它不是用户事实，也不代表现实位置、日程或传感器信息。默认画像是普通、安静的日常生活，可按配置覆盖。
+`persona_profile` 可配置角色姓名、明确虚构的生活背景、兴趣、作息和每日事件种子。该设定会影响日常事件骨架及回复/规划上下文；它不是用户事实，也不代表现实位置、日程或传感器信息。默认画像为整合骑士爱丽丝；只对完全匹配旧默认的普通生活画像做内存迁移，自定义画像保留。角色核心的童年记忆边界不由兴趣字段覆盖。
 
-每日生活分享候选只在 `daily_events_enabled=true` 且已有可用事件时参与主动评估；默认允许时段为本机时间 09:00–21:00，每会话每天最多 2 次此类规划尝试。既有活跃会话保护、冷却、评分、Jev gate 和 `proactive_daily_budget` 仍生效，因此不会承诺或强制每天发送；每日事件总开关默认关闭。
+每日生活分享候选只在 `daily_events_enabled=true` 且已有可用事件时参与主动评估；默认允许时段为本机时间 09:00–21:00，每会话每天最多 2 次此类规划尝试。既有活跃会话保护、冷却、评分、Jev gate 和 `proactive_daily_budget` 仍生效，因此不会承诺或强制每天发送；每日事件总开关默认关闭。v0.9.1 通过评分后，按心情、精力、压力和具体事件计算当天概率；可用模型每天辅助判断一次，失败回退规则。每会话每日一次抽签，正反结果均持久化，不因Tick或重启重抽。默认基础概率0.55不是最终送达率；默认日常评分门槛从0.45降至0.35，旧实例须自行核对配置。详见 [主动消息链路](docs/PROACTIVE.md)。
 
 ### 回复时机与连续输入
 
@@ -315,7 +325,7 @@ $env:PYTHONPATH='E:\AstrBot\backend\app'
 & 'E:\AstrBot\backend\python\python.exe' -m unittest discover -s astrbot_plugin_alice_agent\tests -t . -v
 ```
 
-2026-10-11 v0.8.4 全量回归 238 项通过（`unittest discover`，AstrBot bundled Python）；源码编译检查和配置 schema 解析也通过。新增 13 项覆盖连续 Tick 的休息闭环、临时真实 SQLite 指标恢复、存储失败与卸载竞态、诊断保留与 TTS 日志开关。v0.8.3 的 209/225 项及更早数量为历史快照。既有回归还覆盖重建插件实例后恢复上下文与心境、取消分段发送只恢复已 yield 首句、隔离与期限、损坏数据修复及并发首次恢复。Jev、LLM、AstrBot 与媒体使用 mock/fake，不调用真实模型或 QQ；这些测试证明本地控制流与框架交接，不证明线上聊天质量或平台实际送达。
+2026-10-13 v0.9.0 全量回归257项通过（`unittest discover`，AstrBot bundled Python），源码编译检查与配置schema解析通过；v0.8.4的238项及更早数量为历史快照。新增19项覆盖小说资料筛选、人物记忆边界、具体场景召回与宽泛标签拒绝、预算和坏数据、配置接入与实际模型请求。既有回归仍覆盖会话恢复、模型回退、休息状态、指标持久化、发送取消及媒体。Jev、LLM、AstrBot 与媒体使用 mock/fake，不调用真实模型或 QQ；这些测试证明本地控制流与框架交接，不证明线上聊天质量或平台实际送达。
 
 ## 当前未实现与限制
 
@@ -330,4 +340,4 @@ $env:PYTHONPATH='E:\AstrBot\backend\app'
 - 媒体功能当前只用于被动聊天回复；主动消息仍为纯文本。
 - 2026-09-23 本机 Genie `127.0.0.1:8000` 的角色加载、参考音频设置、TTS 均返回 200，且一次实际 Renderer 合成的 WAV 成功通过 QQ 官方 Record→Silk 转换；该 smoke 使用固定日文文本，未测 DeepL/LLM 翻译。尚未验证真实 QQ API 送达/播放。2026-09-28 复核配置时 `media_enabled=true`、`media_voice_enabled=true`；新日志代码仍需插件重载后才能进入运行中的进程。
 - SharedExperience 尚未自动提取；没有 Autobiographical/Emotional Memory consolidation。
-- 未实现桌宠、WebSocket、Live2D、LoRA、小说 RAG、多 Agent、复杂 Goal Planning 或自主工具循环。
+- 未实现桌宠、WebSocket、Live2D、LoRA、小说向量检索／全书问答、多 Agent、复杂 Goal Planning 或自主工具循环；已提供受限的角色资料与精选对白本地检索。

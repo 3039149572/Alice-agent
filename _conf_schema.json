@@ -54,10 +54,46 @@
     "type": "float",
     "default": 3.0
   },
-  "persona_profile": {
-    "description": "Alice 的可编辑虚构日常背景、兴趣、作息和每日事件种子（JSON）",
+  "novel_context_enabled": {
+    "description": "按本轮话题检索小说角色资料及对白参考",
+    "type": "bool",
+    "default": true,
+    "hint": "使用本地静态资料，不增加 LLM/Jev 调用。与用户聊天记忆分开；重载插件生效。关闭只停用检索，不改变整合骑士默认身份。"
+  },
+  "novel_context_dir": {
+    "description": "自定义角色资料目录，留空使用随插件提供的筛选资料",
     "type": "string",
-    "default": "{\"name\":\"Alice\",\"life_background\":\"这是明确虚构的普通生活设定，不对应现实中的位置、日程或传感器状态：Alice住在一个不指明城市和季节的普通居住环境里，有一张常用的小书桌，用来读写、整理便签和放手边的小物件。她的生活以普通琐事和安静兴趣为主，日子大多平稳，偶尔被小事打断后会重新安排。\",\"interests\":[\"短篇阅读\",\"音乐\",\"简单点心\",\"随手记下的问题\",\"整理小物件\"],\"daily_rhythm\":[\"开始一天时通常先处理一件轻量小事，再逐渐进入状态。\",\"忙碌时会留一点短暂休息；空下来时偏好读几页或听点音乐。\",\"日程偶尔会被琐事打断，她一般通过重新排序来调整。\"],\"daily_event_seeds\":{}}",
+    "default": "",
+    "hint": "目录应有 facts.jsonl 与 dialogues.jsonl；只读取数据，不执行资料中的脚本。缺失、损坏或超限时回退无检索上下文，保留角色核心规则。"
+  },
+  "novel_context_stage": {
+    "description": "小说资料阶段",
+    "type": "string",
+    "default": "integrity_knight",
+    "options": ["integrity_knight", "later_canon"],
+    "hint": "默认使用骑士时期资料，童年只作读者背景。later_canon 可检索现实世界及 Unital Ring 后期条目；两者均不恢复童年记忆，且不把用户当原著人物。"
+  },
+  "novel_fact_limit": {
+    "description": "每轮最多提供的剧情资料卡数（0～4）",
+    "type": "int",
+    "default": 3
+  },
+  "novel_dialogue_limit": {
+    "description": "生成回复时最多提供的原著对白范例数（0～4）",
+    "type": "int",
+    "default": 3,
+    "hint": "只匹配具体主题和细粒度触发语，不用宽泛tag兜底；检查人格、阶段、Planner action及关系边界，不凑满数量。"
+  },
+  "novel_context_max_chars": {
+    "description": "单轮角色检索 JSON 的最大字符数（1000～12000）",
+    "type": "int",
+    "default": 6000,
+    "hint": "超预算时丢弃整张候选卡，不截断 JSON 或原句。此预算不含原有聊天历史与提示词。"
+  },
+  "persona_profile": {
+    "description": "整合骑士爱丽丝的可编辑虚构背景、兴趣、作息和小事件种子（JSON）",
+    "type": "string",
+    "default": "{\"name\": \"Alice\", \"life_background\": \"这是《刀剑神域》的虚构角色设定：Alice是整合骑士爱丽丝·辛赛西斯·萨提，以守护人界和同伴为职责，能独立判断教会命令是否正当。她在合成秘仪后没有童年爱丽丝·滋贝鲁库的亲历记忆；关于卢利特村和家人的过去只能通过他人讲述了解，不将熟悉感、资料或转述当成恢复记忆。具体往事按本轮资料注明的阶段和知情方式使用。这不代表实时行踪、现实身体或与用户已经发生过共同经历。\", \"interests\": [\"剑术与神圣术的研习\", \"同伴的近况\", \"人界与故乡\", \"职责之外的日常\"], \"daily_rhythm\": [\"认真处理职责，也允许疲惫、停歇和日常闲谈；不必每轮谈及骑士身份。\", \"没有已记录事件时，不声称正在巡逻、训练或刚见过原著人物。\", \"回顾的是骑士时期的判断和经历，不是已经失去的童年画面。\"], \"daily_event_seeds\": {}}",
     "hint": "只填写角色虚构设定，不代表用户或现实传感器信息。字段：name、life_background、interests、daily_rhythm、daily_event_seeds。"
   },
   "daily_event_max": {
@@ -246,11 +282,13 @@
     "default": true
   },
   "proactive_score_threshold": {"description": "主动行为高门槛", "type": "float", "default": 0.72},
-  "proactive_daily_score_threshold": {"description": "每日生活分享候选的专用评分门槛（0–1）", "type": "float", "default": 0.45},
+  "proactive_daily_score_threshold": {"description": "每日生活分享候选的专用评分门槛（0–1，推荐0.35；旧版0.45容易长期拦截）", "type": "float", "default": 0.35},
+  "proactive_daily_probability": {"description": "每日主动分享基础概率（0–1，叠加心情、精力、压力及事件重要性）", "type": "float", "default": 0.55},
+  "proactive_daily_probability_llm_enabled": {"description": "用当前会话模型辅助判断当日分享意愿（每会话每天至多一次，失败回退规则）", "type": "bool", "default": true},
   "proactive_defer_threshold": {"description": "主动行为延后门槛", "type": "float", "default": 0.60},
   "proactive_min_interval": {"description": "全局及单用户主动消息最短间隔（秒）", "type": "float", "default": 21600.0},
   "proactive_same_topic_interval": {"description": "同话题主动消息最短间隔（秒）", "type": "float", "default": 86400.0},
-  "proactive_daily_budget": {"description": "每用户每日主动消息上限", "type": "int", "default": 1},
+  "proactive_daily_budget": {"description": "每用户滚动24小时主动消息上限", "type": "int", "default": 1},
   "proactive_window_start": {"description": "主动消息本地允许时段开始（HH:MM）", "type": "string", "default": "09:00"},
   "proactive_window_end": {"description": "主动消息本地允许时段结束（HH:MM）", "type": "string", "default": "21:00"},
   "proactive_daily_attempt_limit": {"description": "每日事件主动分享每天尝试上限", "type": "int", "default": 2},

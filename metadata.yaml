@@ -4,7 +4,7 @@ author: local
 repo: https://github.com/3039149572/Alice-agent
 description: 可独立演进的 Alice 角色 Agent Core；AstrBot 仅承担消息与 Provider 适配。
 desc: 可独立演进的 Alice 角色 Agent Core；AstrBot 仅承担消息与 Provider 适配。
-version: 0.8.4
+version: 0.9.1
 astrbot_version: ">=4.25.5,<5"
 support_platforms:
   - aiocqhttp

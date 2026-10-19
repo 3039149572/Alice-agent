@@ -1,11 +1,23 @@
-# Alice Agent v0.8.4 交接文档
+# Alice Agent v0.9.1 交接文档
 
-最后核验日期：2026-10-11（v0.8.4 本地运行逻辑与模型回退；实例状态保留各段原核验日期）
+最后核验日期：2026-10-19（主动消息链路与每日概率；历史实例记录保留原日期）
 项目路径：`C:\Users\Administrator\.astrbot\data\plugins\astrbot_plugin_alice_agent`  
-当前版本：`0.8.4`
+当前版本：`0.9.1`；源码与安装包以GitHub main及Releases实际记录为准。
 AstrBot 兼容声明：`>=4.25.5,<5`
 
 本文档面向接手该项目的新对话或新开发者。它描述当前工作区真实存在的实现，不代表最初需求文档中的所有设想都已经完成。
+
+## v0.9.1 主动消息更新
+
+默认每日事件开关仍为false，打开主动开关不保证有候选。普通事件低社交需求时评分约0.3495，旧门槛0.45会长期拦截；新默认0.35，既有服务器配置需手动调整。核对本机配置时 daily_events_enabled/proactive_enabled/agent_loop_enabled 均为true，但这不是服务器证据。
+
+新增每天一次的分享概率：规则看心情、精力、压力与事件，默认额外模型判断意愿再各占一半混合；每会话每天一次抽签，正反结果均写入新增SQLite表。关闭模型可只用规则。没有抽中时不规划，不按Tick反复抽签；次日首次满足条件重新判断。概率表示允许进一步规划，最终发送仍受其它门控约束。
+
+后台INFO显示实际开关、本地时间/时区、日常门槛、滚动24小时预算及具体拦截原因；同原因每会话每小时最多一次。保留15分钟活跃保护、7天活跃范围、未回复保护、冷却与预算。补齐模型期间新消息取消及发送前时段/日期/冷却复核。
+
+本机当前QQ官方适配器有私聊主动发送实现，Context旧的“不支持”注释不能作为平台结论。框架布尔返回不等于平台送达回执。未取得服务器日志和配置，未做真实模型/QQ验收。
+
+配置、概率公式、成本、排查和剩余限制以 [docs/PROACTIVE.md](docs/PROACTIVE.md) 与 [SERVER_UPDATE.md](SERVER_UPDATE.md) 为准。包含此前本地v0.9.0的228事实/28对白。新增12项，全量269项本地回归；模型/发送为fake，重启验证使用临时真实SQLite。此前257项等记录为历史基线。
 
 ## 1. 接手前必须知道的事实
 
@@ -18,7 +30,7 @@ AstrBot 兼容声明：`>=4.25.5,<5`
 7. Response Generator 优先使用 AstrBot 当前会话的 LLM Provider；2026-10-11 修复后，失败时按当前会话配置顺序尝试备用模型。Jev 不生成回复文本。
 8. `alice_agent/` Core 不依赖 AstrBot、httpx、TypeSafe SDK 或 TypeSafe endpoint。
 9. Reactive 回复支持可选 Genie TTS 与表情包选择（默认 `media_enabled=false`）；QQ 官方平台语音独立发送，主动消息仍为纯文本，文本均可逐句发送。
-10. v0.8.4（2026-10-11）新增 13 项，全量 238 项、源码编译和配置 schema 解析通过。v0.8.3 的 209 项（2026-09-30）及模型回退修复后的 225 项（2026-10-11）是历史基线。
+10. v0.9.0（2026-10-13）新增19项，全量257项、源码编译和配置schema解析通过；28条对白逐字及747处源证据逐行核对通过。v0.8.4的238项与更早数量为历史基线。
 11. 本地语义 VAD 默认启用；Jev 是否运行仍由现有 `jev_enabled` 与凭据控制，未启用时不调用远端。
 12. 逐轮诊断 JSON 默认关闭；启用会保存敏感私聊文本及模型/状态诊断。
 13. 此前本机已完成 Genie TTS 与本地 WAV→QQ Record→Silk 贯通验证，但尚未做 QQ 平台实际送达验收。
@@ -27,6 +39,7 @@ AstrBot 兼容声明：`>=4.25.5,<5`
 16. 2026-09-29 的历史实例记录为 `media_enabled=true`、`media_emoji_enabled=true`、`test_log_enabled=true`、`daily_events_enabled=true`、Jev `shadow`、`jev_review_threshold=0.60`；这些不是插件默认值，也未在本次核对为当前值。Jev 实际采用下限仍固定 0.80。代码修改没有重载插件或改写运行配置。
 17. v0.8.1 的回复风格提示由本地规则构造，不增加 LLM/Jev 调用；表情语义对齐是有限的确定性筛选，不读取图片像素、不保证中文语义准确，也未做真实 QQ 平台送达验收。
 18. v0.8.4 补齐按实际闲置时间进入/退出休息的确定性规则，默认保存无文本的 Jev 汇总指标；TTS 原文/译文日志改为默认关闭，诊断保留期限为可选配置。详细变更见 `CHANGELOG.md`。
+19. v0.9.0 默认人格改为整合骑士爱丽丝，没有童年滋贝鲁库的亲历记忆；可以了解他人转述，不把资料、名字熟悉感或情绪当成记忆恢复。小说知识与用户真实聊天记忆分开，宽泛tag不触发召回。静态资料和接入说明见 `docs/NOVEL_CONTEXT.md`。
 
 ## 2. 当前总体定位
 
@@ -87,6 +100,7 @@ LLM generation
 | Daily Events & Mood | 已完成可选基础 | 本地小事件、可选 LLM/Jev、有界情绪影响、SQLite 跨日恢复；默认关闭 |
 | Relationship | 已完成 | user 隔离、SQLite 持久化、保守增量更新 |
 | Local Memory | 已完成 | SQLite 内容存储、原始轮次记录、user/session scope |
+| Novel Character Knowledge | 已完成本地基础 | 228张只读剧情卡与28条精选对白；具体主题检索、阶段和知情边界、有限上下文；无向量或新增模型调用 |
 | Memory Metadata | 已完成 | importance/emotion/relationship/access/pinned 等 SQLite metadata |
 | Memory Reranker | 已完成 | relevance gate、代码评分、Top N、DEBUG explainability |
 | SharedExperience | 部分完成 | 模型和持久化入口存在；没有自动提取 |
@@ -293,6 +307,16 @@ AstrBot Adapter 在 Pipeline 返回后执行媒体 I/O：若选择语音则按 G
 | Response | 返回配置中的友好 fallback 文本 |
 | Memory observe | 记录异常，不影响已经生成的回复 |
 
+### 小说资料与对白（v0.9.0接入，随v0.9.1发布）
+
+`ContextBuilder` 启动时加载 `alice_agent/knowledge/data/` 的只读JSONL，不将小说批量写入用户数据库。Planner获得相关剧情背景；Response的实际LLM请求另获得 `character_knowledge.dialogue_examples`，包含具体场景、原句、原受话者、来源与限制，与 `selected_memories/recent_history` 分开。
+
+默认每轮最多3张剧情卡、3条对白，新增JSON最多6000字符。有具体触发语且action兼容才提供对白；“关心、解释、确认、日常聊天”等宽泛标签不参与召回，也不放进给回复模型的示例上下文。缺失、损坏或无匹配时回退空结果。没有额外LLM/Jev/embedding调用，但已有请求的上下文token会增加。
+
+默认 `integrity_knight` 只使用13条骑士阶段对白、89张骑士剧情卡，以及44张童年背景卡。童年卡统一为 `reader_background`；骑士时期听闻童年的记录也不恢复童年亲历记忆。后期15条对白和95张剧情卡默认禁用，需显式设置 `later_canon`；不是严格逐章时间线系统。自定义每日事件种子、默认模板及LLM扩写均防止虚构童年回忆。
+
+根据用户全章覆盖版压缩包筛选，不导入补篇、全文、未确定事项或译者评论。剔除威胁式手帕台词和空泛确认句，修正冻结中贝尔库利的“临终”误标。来源哈希、筛选条件及字面核对报告均保留；资料语义和真实模型角色质量仍不能由这些核对直接证明。当前未发布或重载生产实例，完整配置与复现见 `docs/NOVEL_CONTEXT.md`。
+
 ## 7. Domain Models
 
 主要领域对象：
@@ -361,7 +385,7 @@ AstrBot 路径在生成时传入 `is_current`，由 Pipeline 的 `commit_deliver
 - 事件骨架由代码选取，可参考前一天事件作有限延续；同会话近期 History（包括有效恢复记录）可提供前 1–3 天用户对话线索。实际仍受最近轮数与恢复期限限制。不会从不存在的 TencentDB 或系统日程读取事件。
 - 可用当前 LLM 将骨架扩写为短句；无效输出或失败回退模板。Jev 可作六轴有界反应评估，`shadow` 仍使用代码值；在 `hybrid/primary` 中，整体或单轴置信度低于 0.80 时尝试 LLM 评分并仅混合低置信轴，LLM 无效或失败时回退代码值。此路径最多额外增加一次 LLM 评分调用，代码限制每日单轴总影响为 ±0.30。
 - 今日事件文本及话题线索进入 State 供回复参考，不要求每轮提及；`memory_candidate` 只是标记，尚未自动写长期 Memory。
-- `persona_profile` 提供明确虚构的普通生活背景、兴趣、作息与事件种子；ContextBuilder 注入回复/Planner/主动规划上下文，DailyEventService 使用兴趣生成小事件骨架。不得把角色设定写成用户事实、现实传感器或真实日程；无效 profile 回退模块默认值。
+- `persona_profile` 默认提供整合骑士爱丽丝的虚构背景、兴趣、作息与事件种子；ContextBuilder 注入回复/Planner/主动规划上下文，DailyEventService 使用兴趣生成小事件骨架。只对完全匹配旧普通生活默认值的画像做内存迁移，有意自定义保留，不改写实例配置。不得把设定写成用户事实、现实观测或实时日程，也不能用兴趣字段覆盖童年记忆边界。
 - 事件批次先存入 `alice_mood.db`，再保存心境；若两步之间中断，下次复用事件批次。LLM/Jev 调用占用会话锁，开启前需评估延迟、费用和隐私。
 
 ### Relationship
@@ -925,10 +949,12 @@ DEBUG：
 
 | 配置 | 默认值 |
 |---|---:|
-| persona_profile | JSON 普通虚构日常画像 |
+| persona_profile | JSON 整合骑士虚构画像 |
 | proactive_window_start / end | 09:00 / 21:00（本地时间） |
 | proactive_daily_attempt_limit | 2 次/会话/日（只限制日常事件规划尝试） |
-| proactive_daily_score_threshold | 0.45（只用于日常事件候选） |
+| proactive_daily_score_threshold | 0.35（旧实例可能仍为0.45） |
+| proactive_daily_probability | 0.55（基础值，受心情/事件/模型影响） |
+| proactive_daily_probability_llm_enabled | true（每天每会话至多1次新增判断） |
 | daily_events_enabled | false |
 
 每日生活分享候选只从每日事件服务已有的当日事件中挑选；`daily_events_enabled` 未开启时没有该类候选。每日 attempt limit 是评分与 cooldown 通过后、Memory/Jev/Planner 之前的规划尝试上限；AgentLoop 每个 Tick 仍会做轻量评估。已发送仍受 `proactive_daily_budget` 默认 1 条限制，不保证每日有消息。
@@ -990,6 +1016,8 @@ DEBUG：
 
 完整配置和字段说明以 `_conf_schema.json` 为准。
 
+小说知识：`novel_context_enabled=true`、`novel_context_stage=integrity_knight`、`novel_context_dir` 留空使用内置资料；`novel_fact_limit=3`、`novel_dialogue_limit=3`、`novel_context_max_chars=6000`。关闭检索不取消角色核心记忆规则；配置修改需重载。
+
 ## 18. 测试与验证
 
 必须使用 AstrBot 自带 Python 环境；系统默认 `E:\Python\python.exe` 没有 pytest。
@@ -1014,10 +1042,10 @@ $env:PYTHONPATH='E:\AstrBot\backend\app'
 & 'E:\AstrBot\backend\python\python.exe' -m compileall -q astrbot_plugin_alice_agent
 ```
 
-最后验证结果（2026-10-11，v0.8.4 本地运行改进）：
+最后验证结果（2026-10-13，v0.9.0 小说资料接入）：
 
 ```text
-Ran 238 tests
+Ran 257 tests
 OK
 ```
 
@@ -1026,6 +1054,9 @@ OK
 覆盖范围：
 
 - AstrBot Filter/Handler/stop_event 顺序
+- 小说知识进入实际回复模型请求、与用户记忆分离、无新增模型调用
+- 具体场景匹配、宽泛标签拒绝、童年/听闻/阶段边界、action与关系兼容、上下文预算、坏数据回退
+- 旧默认画像内存迁移、每日事件的种子/模板/模型输出不伪造童年记忆恢复
 - 当前 session Provider 调用及备用模型顺序回退、错误/空输出、取消与总超时边界
 - Core/AstrBot/Jev infrastructure 边界
 - Pipeline fallback
@@ -1083,6 +1114,7 @@ OK
 16. 旧核验曾发现 `127.0.0.1:8000` 不可连接；本次未重新探测外部服务，不能把旧结果视为当前状态。真实 Genie 音色、速度和 QQ Record 播放尚未验收。
 17. Media 只覆盖 Reactive 回复；Proactive 内容仍为纯文本，但支持分段发送。
 18. 新插件读取既有索引，但不包含 `/dg-build-audio` / `/dg-build-emoji` 等索引构建命令。
+19. 小说检索是本地词法与具体短语匹配，未匹配表达可能漏召回；当前资料并非穷尽所有对白，也未经真实模型多轮角色验收。来源片段逐字核对不等于全部语义标注无误。
 
 ## 20. 明确未实现的功能
 
@@ -1098,7 +1130,7 @@ OK
 - Streaming Action Protocol
 - Live2D
 - LoRA
-- 小说 RAG
+- 小说向量检索／全书问答（当前已有受限的本地角色资料与对白检索）
 - 视觉/语音输入
 - Tool Calling
 - MCP Agent
@@ -1136,7 +1168,7 @@ OK
 1. 阅读 `HANDOFF.md` 和 `README.md`。
 2. 检查当前目录树和 `metadata.yaml`。
 3. 检查最近文件改动，不假设本文档之后没有变化。
-4. 运行当前全量回归测试；v0.8.4 于 2026-10-11 全量 238 项通过，模型回退修复后的 225 项及更早结果为历史基线。
+4. 运行当前全量回归测试；v0.9.0 于2026-10-13全量257项通过，v0.8.4的238项及更早结果为历史基线。
 5. 检查 `alice_agent/` 是否仍无 AstrBot/HTTP infrastructure import。
 6. 如果要改 AstrBot Adapter，重新核对当前安装版本和官方插件 API。
 7. 如果要改 Jev Adapter，重新核对 TypeSafe 官方 API/OpenAPI 和 model list。
@@ -1160,10 +1192,11 @@ C:\Users\Administrator\.astrbot\data\plugins\astrbot_plugin_alice_agent
 - _conf_schema.json
 - 当前 tests
 
-当前版本为 v0.8.4。
+当前版本为 v0.9.1，含小说资料与每日主动概率，发布状态查看GitHub Releases。
 
 重要事实：
 - Memory 当前是纯本地 SQLite，不存在 TencentDB/MemoryCore Adapter。
+- 默认扮演整合骑士爱丽丝，没有童年亲历记忆；小说资料作为独立character_knowledge上下文，宽泛tag不召回。内置228张剧情卡与28条精选对白，默认不检索后期资料，具体配置见docs/NOVEL_CONTEXT.md。
 - Jev Decision Layer 已完成基础接入；schema 默认 jev_enabled=false/jev_mode=shadow。最近核对的实例显式启用且处于 shadow，不能把实例配置当作默认值。
 - 首次启用 Jev 应使用 shadow，不得直接切 primary。
 - ResponseGenerator 优先使用 AstrBot 当前会话 Provider，失败时按 `agent_runner.config.model.fallback_provider_ids` 顺序回退；共用原有每次调用的总超时预算。
@@ -1204,3 +1237,5 @@ Reactive Pipeline
 ```
 
 后续重点是生产验证：每日事件的实际表现与费用、真实 QQ 长期运行、Jev 中文校准、真实 Genie/QQ 播放验收，以及指标分组与时间事件提取。休息状态规则、指标持久化和日志治理已在 v0.8.4 完成本地验证，仍需观察真实长期表现。后续开发必须继续保持 Core 与 AstrBot、Memory Backend、Decision Backend 和媒体 I/O 的可替换边界。
+
+v0.9.0 本地新增角色知识与对白接入及提示词调整；后续需要真实模型角色验收，重点观察童年转述、默认阶段、具体场景命中、拒绝宽泛标签和与用户关系不混淆。v0.9.1包含这些资料和接入；旧v0.8.4不包含。更新后需要重载。

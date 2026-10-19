@@ -13,6 +13,10 @@ from astrbot_plugin_alice_agent.adapters.astrbot.text_segments import split_text
 class CapturingLogger:
     def __init__(self) -> None:
         self.exceptions: list[str] = []
+        self.warnings: list[str] = []
+
+    def warning(self, message: str) -> None:
+        self.warnings.append(message)
 
     def exception(self, message: str) -> None:
         self.exceptions.append(message)

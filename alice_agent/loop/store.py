@@ -22,6 +22,14 @@ class InMemoryAutonomyStore:
         self.last_proactive_by_session: dict[str, float] = {}
         self.actions: dict[str, CandidateAction] = {}
         self.daily_proactive: dict[tuple[str, str], dict[str, Any]] = {}
+        self.daily_decisions: dict[tuple[str, str], dict[str, Any]] = {}
+
+    async def get_daily_proactive_decision(self, session_id: str, day: str):
+        value = self.daily_decisions.get((session_id, day))
+        return dict(value) if value is not None else None
+
+    async def save_daily_proactive_decision(self, session_id: str, day: str, value: dict):
+        return dict(self.daily_decisions.setdefault((session_id, day), dict(value)))
 
     async def get_drive(self, session_id: str) -> DriveState | None:
         value = self.drives.get(session_id)
@@ -130,6 +138,7 @@ class InMemoryAutonomyStore:
     async def maintenance(self, now: float) -> None:
         self.sends = [row for row in self.sends if row["sent_at"] >= now - 172800.0]
         cutoff = (datetime.fromtimestamp(now).date() - timedelta(days=30)).isoformat()
+        self.daily_decisions = {k: v for k, v in self.daily_decisions.items() if k[1] >= cutoff}
         self.daily_proactive = {
             key: value for key, value in self.daily_proactive.items() if key[1] >= cutoff
         }
@@ -186,7 +195,29 @@ class SQLiteAutonomyStore:
                     delivered_event_ids TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY(session_id,day)
                 );
+                CREATE TABLE IF NOT EXISTS daily_proactive_decisions (
+                    session_id TEXT NOT NULL, day TEXT NOT NULL, payload TEXT NOT NULL,
+                    PRIMARY KEY(session_id,day)
+                );
             """)
+
+    async def get_daily_proactive_decision(self, session_id: str, day: str):
+        def query():
+            with closing(self._connect()) as db:
+                row = db.execute("SELECT payload FROM daily_proactive_decisions WHERE session_id=? AND day=?",
+                                 (session_id, day)).fetchone()
+                return json.loads(row[0]) if row else None
+        return await self._run(query)
+
+    async def save_daily_proactive_decision(self, session_id: str, day: str, value: dict):
+        def query():
+            with closing(self._connect()) as db, db:
+                db.execute("INSERT OR IGNORE INTO daily_proactive_decisions VALUES(?,?,?)",
+                           (session_id, day, json.dumps(value, ensure_ascii=False)))
+                row = db.execute("SELECT payload FROM daily_proactive_decisions WHERE session_id=? AND day=?",
+                                 (session_id, day)).fetchone()
+                return json.loads(row[0])
+        return await self._run(query)
 
     async def _run(self, function):
         async with self._lock:
@@ -384,6 +415,7 @@ class SQLiteAutonomyStore:
             with closing(self._connect()) as db, db:
                 db.execute("DELETE FROM proactive_sends WHERE sent_at<?", (now - 172800.0,))
                 db.execute("DELETE FROM daily_proactive_state WHERE day<?", (cutoff,))
+                db.execute("DELETE FROM daily_proactive_decisions WHERE day<?", (cutoff,))
                 rows = db.execute("SELECT id,payload FROM scheduled_context_events WHERE status='scheduled'").fetchall()
                 for row in rows:
                     event = ScheduledContextEvent(**json.loads(row["payload"]))

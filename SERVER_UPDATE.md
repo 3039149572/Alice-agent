@@ -2,7 +2,33 @@
 
 源码仓库：https://github.com/3039149572/Alice-agent
 
-当前发布版本为 v0.8.4。本仓库包含插件源码、配置字段定义、提示词和测试，包含 AstrBot 备用模型回退、休息状态闭环及决策指标持久化。聊天记录、密钥、实例配置、音频和表情素材不随源码发布。
+v0.9.1 包含主动分享链路修复、心情/每日事件驱动的当天概率，以及此前的整合骑士角色知识与精选对白。源码、配置字段定义、提示词、测试和 `alice_agent/knowledge/data/` 静态资料随版本发布；聊天记录、密钥、实例配置、音频和表情素材独立保管。角色知识配置见 `docs/NOVEL_CONTEXT.md`。
+
+## Release 安装与主动消息设置
+
+[下载 v0.9.1 Release](https://github.com/3039149572/Alice-agent/releases/tag/v0.9.1) 中的 Source code (zip)，可用于AstrBot本地ZIP安装；也可通过下方仓库地址更新/重新安装。升级前备份实例配置与 `data/plugin_data/astrbot_plugin_alice_agent`，不要删除数据库或加载两份插件；完成后重载。
+
+旧配置不会因为新默认值而自动覆盖，请核对：
+
+```json
+{
+  "agent_loop_enabled": true,
+  "proactive_enabled": true,
+  "daily_events_enabled": true,
+  "daily_event_max": 2,
+  "proactive_daily_score_threshold": 0.35,
+  "proactive_daily_probability": 0.55,
+  "proactive_daily_probability_llm_enabled": true,
+  "proactive_daily_budget": 1,
+  "proactive_daily_attempt_limit": 2
+}
+```
+
+这些是合并到原配置的字段，不是整份配置。不要覆盖模型、平台或密钥配置。开启每日事件会有扩写调用；新增分享意愿模型每会话每天至多1次，失败回退规则。关闭 `proactive_daily_probability_llm_enabled` 可只用规则。
+
+先发一条私聊登记会话；15分钟活跃保护结束后，在服务器本地09:00–21:00参与判断。确认进程/容器时区（中国时间可设 `TZ=Asia/Shanghai`）。看 `PROACTIVE startup`、`PROACTIVE session=... decision=...` 日志定位评分、抽签、未回复、冷却或预算阻断；同原因每会话每小时最多记录一次。抽签正反结果会保持到次日，不要为重抽而删除数据库。具体公式、调用成本和平台差异见 [主动消息说明](docs/PROACTIVE.md)。
+
+仓库工作流在main的版本文件更新时自动创建对应标签与Release；已有同名Release不会覆盖。应核对Release实际存在，工作流成功不代替QQ发送验收。
 
 ## 推荐：使用 AstrBot 插件管理
 

@@ -15,6 +15,8 @@ from ..relationship.models import RelationshipState, relationship_summary
 from ..drives.models import DriveState
 from ..proactive.models import CandidateAction, UserAvailability
 from ..persona.profile import PersonaProfile, coerce_persona_profile
+from ..knowledge.novel import MEMORY_BOUNDARY, NovelContextConfig, NovelKnowledge
+from ..ports.logging import LoggerPort
 
 
 _STYLE_HISTORY_SCAN_LIMIT = 16
@@ -174,12 +176,17 @@ class ContextBuilder:
         self,
         package_root: Path | None = None,
         profile: PersonaProfile | dict[str, object] | None = None,
+        novel_config: NovelContextConfig | None = None,
+        logger: LoggerPort | None = None,
     ) -> None:
         self._root = package_root or Path(__file__).resolve().parents[1]
         self._prompt_dir = self._root / "prompts"
         self._persona_dir = self._root / "persona"
         self._cache: dict[Path, str] = {}
         self.profile = coerce_persona_profile(profile)
+        config = novel_config or NovelContextConfig()
+        directory = Path(config.directory) if config.directory else self._root / "knowledge" / "data"
+        self.novel_knowledge = NovelKnowledge(directory, config, logger)
 
     def _read(self, path: Path) -> str:
         if path not in self._cache:
@@ -188,6 +195,16 @@ class ContextBuilder:
 
     def _prompt(self, name: str) -> str:
         return self._read(self._prompt_dir / name).replace("Alice", self.profile.name)
+
+    def _novel_context(
+        self, text: str, perception: PerceptionResult | None = None,
+        plan: ActionPlan | None = None, relationship: RelationshipState | None = None,
+        *, examples: bool = False,
+    ) -> dict:
+        context = self.novel_knowledge.retrieve(text, perception, plan, relationship)
+        if not examples:
+            context.pop("dialogue_examples", None)
+        return context
 
     @staticmethod
     def _history(history: list[ConversationTurn], limit: int = 4) -> list[dict[str, object]]:
@@ -276,6 +293,7 @@ class ContextBuilder:
             "persona_profile": self.profile.prompt_context(),
             "event_skeleton": skeleton,
             "recent_user_text": (recent_user_text or "")[:160],
+            "character_memory_boundary": MEMORY_BOUNDARY,
         }
         return self._prompt("daily_event.txt"), json.dumps(payload, ensure_ascii=False)
 
@@ -323,6 +341,7 @@ class ContextBuilder:
             "conversation_style_guidance": conversation_style_guidance,
             "personality_principles": personality,
             "persona_profile": self.profile.prompt_context(),
+            "character_knowledge": self._novel_context(event.text or "", perception, relationship=relationship),
         }
         return self._prompt("planner.txt"), json.dumps(payload, ensure_ascii=False)
 
@@ -357,6 +376,9 @@ class ContextBuilder:
             "selected_memories": self._memories(memories),
             "recent_history": self._history(history),
             "conversation_style_guidance": conversation_style_guidance,
+            "character_knowledge": self._novel_context(
+                event.text or "", perception, plan, relationship, examples=True,
+            ),
         }
         return self._prompt("response.txt"), json.dumps(payload, ensure_ascii=False)
 
@@ -377,6 +399,9 @@ class ContextBuilder:
                 "relevance": candidate.relevance,
                 "topic": candidate.topic,
                 "context_summary": candidate.metadata.get("summary", ""),
+                "daily_event_id": candidate.metadata.get("daily_event_id"),
+                "daily_event_day": candidate.metadata.get("daily_event_day"),
+                "daily_decision": candidate.metadata.get("daily_decision"),
             },
             "state": asdict(state),
             "relationship": relationship_summary(relationship),
@@ -388,5 +413,10 @@ class ContextBuilder:
             "relevant_memories": self._memories(memories),
             "availability": asdict(availability),
             "persona_profile": self.profile.prompt_context(),
+            "character_knowledge": self._novel_context(
+                " ".join(str(value or "") for value in (
+                    candidate.topic, candidate.reason, candidate.metadata.get("summary"),
+                )), relationship=relationship,
+            ),
         }
         return self._prompt("proactive_planner.txt"), json.dumps(payload, ensure_ascii=False)

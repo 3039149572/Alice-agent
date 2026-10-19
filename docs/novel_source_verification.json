@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "counts": {
+    "dialogues.jsonl": 28,
+    "facts.jsonl": 228
+  },
+  "dialogue_quote_checks": 28,
+  "source_evidence_checks": 747,
+  "original_txt_checked": true,
+  "source_sha256": "413e5c4e7687bd5ccb70127100dca1d84d43765091301e45763289d2d2e32681",
+  "scope": "source integrity and literal quotations, not a model-quality or exhaustive semantic audit"
+}

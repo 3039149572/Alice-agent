@@ -1,0 +1,33 @@
+name: Publish plugin release
+
+on:
+  push:
+    branches: [main]
+    paths: [metadata.yaml, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: plugin-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish version from metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version: *//p' metadata.yaml | tr -d '\r')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "Release v$version already exists; leaving it unchanged."
+            exit 0
+          fi
+          gh release create "v$version" --target "$GITHUB_SHA" \
+            --title "Alice Agent v$version" --notes-file .github/RELEASE_NOTES.md --latest
