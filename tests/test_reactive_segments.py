@@ -222,8 +222,11 @@ class ReactiveSegmentIntegrationTests(unittest.IsolatedAsyncioTestCase):
         segment_pause_started = asyncio.Event()
         release_segment_pause = asyncio.Event()
         second_entered_handler = asyncio.Event()
+        second_response_started = asyncio.Event()
 
         async def response_for_event(agent_event) -> AgentResponse:
+            if agent_event.text == "second":
+                second_response_started.set()
             text = first_text if agent_event.text == "first" else second_text
             return AgentResponse(text, f"trace-{agent_event.text}")
 
@@ -253,11 +256,19 @@ class ReactiveSegmentIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await segment_pause_started.wait()
             second_task = asyncio.create_task(collect(event_b, "second"))
 
-            with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(second_entered_handler.wait(), timeout=0.01)
-
-            release_segment_pause.set()
-            await asyncio.gather(first_task, second_task)
+            try:
+                # Intake intentionally remains outside the data/send locks so
+                # new input can invalidate stale work. Only generation/output
+                # must wait until the preceding segmented delivery finishes.
+                await asyncio.wait_for(second_entered_handler.wait(), timeout=2)
+                self.assertFalse(second_response_started.is_set())
+                self.assertEqual(
+                    [(label, text) for label, text in timeline if label in {"first", "second"}],
+                    [("first", "A" * 50 + "。")],
+                )
+            finally:
+                release_segment_pause.set()
+                await asyncio.gather(first_task, second_task)
 
         chunks = [(label, text) for label, text in timeline if label in {"first", "second"}]
         self.assertEqual(

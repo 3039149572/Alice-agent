@@ -11,7 +11,7 @@ Same-day reload appends; local-date rollover atomically replaces the same file.
 An independent 60-second watcher also works when the agent loop is disabled.
 No added model/draw/send is used for diagnosis. See PROACTIVE_LOG.md.
 
-Local unpacked-package validation: **336 tests passed in 18.786s**, 195 Python
+Local unpacked-package validation: **336 tests passed in 19.460s**, 195 Python
 sources compiled, 132 effective schema defaults checked and 230 source files
 verified. The 13 new log tests cover rollover/reload, concurrency, scoped
 cleanup, unchanged probability/model calls, platform refusal, cancellation and
@@ -19,6 +19,11 @@ disk errors. No production reload or real-model/QQ test was performed.
 
 Publication will be verified using the GitHub tag/Release and Actions evidence;
 it does not imply production reload or real-model/QQ/Genie acceptance.
+The initial Linux CI run exposed an old concurrency test expecting input
+registration itself to be blocked. This conflicts with deliberate immediate
+intake/invalidation. The test now synchronizes using events and verifies that
+registration proceeds while generation/output stay serialized; the complete
+output ordering assertion remains. No production sending behavior was changed.
 The records below retain the historical local-only validation state.
 
 ## Previous local-only delivery (historical)
