@@ -145,7 +145,7 @@ class LLMFallbackTests(unittest.IsolatedAsyncioTestCase):
         context.get_config = Mock(side_effect=OSError("cannot read config"))
         self.assertEqual((await AstrBotLLMAdapter(context).generate(self.request)).model, "primary")
 
-    async def test_total_timeout_cancels_without_starting_more_providers(self):
+    async def test_total_timeout_bounds_primary_and_reserved_backup_attempts(self):
         context = FallbackContext({}, ["backup"])
         context.llm_generate = AsyncMock(side_effect=lambda **kwargs: None)
 
@@ -156,7 +156,7 @@ class LLMFallbackTests(unittest.IsolatedAsyncioTestCase):
         service = LLMService(AstrBotLLMAdapter(context), timeout=1.0)
         with self.assertRaises(TimeoutError):
             await service.generate(self.request)
-        self.assertEqual(context.llm_generate.await_count, 1)
+        self.assertEqual(context.llm_generate.await_count, 2)
 
     async def test_reactive_handler_uses_backup_for_perception_planner_and_response(self):
         from astrbot_plugin_alice_agent.tests.test_astrbot_adapter import FakeContext, FakeEvent

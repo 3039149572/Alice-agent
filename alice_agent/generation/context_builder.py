@@ -208,7 +208,7 @@ class ContextBuilder:
 
     @staticmethod
     def _history(history: list[ConversationTurn], limit: int = 4) -> list[dict[str, object]]:
-        return [asdict(turn) for turn in history[-limit:]]
+        return [{"user_text": turn.user_text, "assistant_text": turn.assistant_text, "timestamp": turn.timestamp} for turn in history[-limit:]]
 
     @staticmethod
     def _current_messages(event: AgentEvent) -> tuple[list[dict[str, object]], list[dict[str, int]]]:

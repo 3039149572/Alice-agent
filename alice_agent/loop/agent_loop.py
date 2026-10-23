@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime
 from uuid import uuid4
@@ -63,6 +64,9 @@ class AgentLoop:
         logger: LoggerPort,
         decision_gate: object | None = None,
         daily_policy: object | None = None,
+        data_service: object | None = None,
+        delivery_coordinator: object | None = None,
+        audit: object | None = None,
     ) -> None:
         self._config = config
         self._bus = event_bus
@@ -72,6 +76,12 @@ class AgentLoop:
         self._drives = drive_manager
         self._states = state_manager
         self._daily_events = daily_events
+        self._data_service = data_service
+        self._delivery = None
+        if delivery_coordinator is not None:
+            from ..core.proactive_delivery import ProactiveDeliveryCommitter
+            self._delivery = ProactiveDeliveryCommitter(delivery_coordinator.journal, store, memory, session_manager)
+            delivery_coordinator.proactive_handler = self._delivery.apply
         self._relationships = relationship_manager
         self._memory = memory
         self._planner = proactive_planner
@@ -82,6 +92,8 @@ class AgentLoop:
         self._sender = sender
         self._sessions = session_manager
         self._logger = logger
+        self._audit_sink = audit
+        self._audit_context = ContextVar("alice_proactive_audit", default=None)
         self._decision_gate = decision_gate
         self._daily_policy = daily_policy or DailyProactivePolicy(
             store, base_probability=config.proactive_daily_probability,
@@ -95,7 +107,24 @@ class AgentLoop:
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    async def inspect_session(self, session_id: str, user_id: str) -> dict:
+        from ..proactive.diagnostics import ProactiveInspector
+        return await ProactiveInspector(self).inspect(session_id, user_id)
+
+    async def _audit(self, stage: str, **details) -> None:
+        context = self._audit_context.get()
+        if context is not None:
+            context["last_stage"] = stage
+            details = {**{k: v for k, v in context.items() if k != "last_stage"}, **details}
+        if self._audit_sink is not None:
+            try:
+                await self._audit_sink.record(stage, **details)
+            except Exception:
+                self._logger.warning("Alice proactive diagnostic sink failed safely")
+
     async def start(self) -> None:
+        if not self._config.agent_loop_enabled:
+            await self._audit("loop_disabled")
         if not self._config.agent_loop_enabled or self.running:
             return
         self._stopping = False
@@ -104,6 +133,7 @@ class AgentLoop:
         ))
         self._task = asyncio.create_task(self._run(), name="alice-agent-loop")
         self._logger.info("Alice Agent Loop started")
+        await self._audit("loop_started")
         self._logger.info(
             f"PROACTIVE startup enabled={self._config.proactive_enabled} "
             f"daily_events={self._config.daily_events_enabled} "
@@ -148,8 +178,9 @@ class AgentLoop:
                 delay = self._config.agent_tick_interval
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 consecutive_errors += 1
+                await self._audit("loop_error", error_type=type(exc).__name__, consecutive_errors=consecutive_errors)
                 self._logger.exception(
                     f"Alice Agent Loop tick failed consecutive={consecutive_errors}"
                 )
@@ -196,6 +227,7 @@ class AgentLoop:
         for scheduled in due:
             due_by_session.setdefault(scheduled.session_id, scheduled)
         sessions = await self._store.list_sessions()
+        await self._audit("tick", session_count=len(sessions), scheduled_count=len(due))
         for session in sessions:
             await self._bus.publish(new_event(
                 EventType.TIME_TICK,
@@ -214,11 +246,38 @@ class AgentLoop:
         self.metrics.do_nothing_count += 1
         suffix = "" if score is None else f" score={score:.3f}"
         self._logger.debug(f"PROACTIVE decision=DO_NOTHING reason={reason}{suffix}")
+        await self._audit("blocked", session_id=session_id, reason=reason, score=score)
         self._diagnose(session_id, reason, self._clock.now())
 
     async def _evaluate_session(
         self, tick_event: AgentEvent, scheduled: ScheduledContextEvent | None
     ) -> None:
+        token = self._audit_context.set({"session_id": tick_event.session_id,
+                                         "user_id": tick_event.user_id, "tick_id": tick_event.event_id})
+        try:
+            await self._audit("evaluation", scheduled=scheduled is not None)
+            await self._evaluate_session_guarded(tick_event, scheduled)
+        except asyncio.CancelledError:
+            await self._audit("cancelled", interrupted_stage=self._audit_context.get().get("last_stage"))
+            raise
+        except Exception as exc:
+            await self._audit("evaluation_error", error_type=type(exc).__name__,
+                              interrupted_stage=self._audit_context.get().get("last_stage"))
+            raise
+        finally:
+            self._audit_context.reset(token)
+
+    async def _evaluate_session_guarded(self, tick_event, scheduled) -> None:
+        if self._data_service is None:
+            await self._evaluate_session_with_data(tick_event, scheduled)
+            return
+        async with self._data_service.guard(tick_event.user_id):
+            if scheduled is not None:
+                live = await self._scheduler.due(tick_event.timestamp)
+                scheduled = next((item for item in live if item.id == scheduled.id), None)
+            await self._evaluate_session_with_data(tick_event, scheduled)
+
+    async def _evaluate_session_with_data(self, tick_event, scheduled) -> None:
         now = tick_event.timestamp
         session_id = tick_event.session_id
         user_id = tick_event.user_id
@@ -244,13 +303,17 @@ class AgentLoop:
         async with self._sessions.lock(session_id):
             history = await self._sessions.load_history(session_id)
             if self._daily_events is not None and recently_active:
+                await self._audit("daily_events_start", enabled=self._config.daily_events_enabled,
+                                  event_limit=self._config.daily_event_max)
                 try:
                     events = await self._daily_events.ensure(
                         session_id, user_id, now, history
                     )
                     if isinstance(events, list):
                         daily_events = [item for item in events if isinstance(item, dict)]
-                except Exception:
+                    await self._audit("daily_events", event_count=len(daily_events))
+                except Exception as exc:
+                    await self._audit("daily_events_error", error_type=type(exc).__name__)
                     self._logger.exception("Alice daily event tick failed safely")
             previous_drives = await self._drives.get(session_id, user_id)
             state = await self._states.advance_time(
@@ -295,6 +358,8 @@ class AgentLoop:
             local_day = datetime.fromtimestamp(now).date().isoformat()
             cached = await self._store.get_daily_proactive_decision(session_id, local_day)
             if cached is not None and not cached["eligible"]:
+                await self._audit("probability", cached=True, **{k: cached.get(k) for k in
+                                  ("eligible", "probability", "roll", "source", "reason")})
                 await self._do_nothing("daily probability chose silence", session_id=session_id)
                 return
             daily_state = await self._store.get_daily_proactive_state(session_id, local_day)
@@ -302,6 +367,8 @@ class AgentLoop:
             attempt_limit = max(0, int(getattr(self._config, "proactive_daily_attempt_limit", 2)))
             attempted = set(daily_state.get("attempted_event_ids", []))
             delivered = set(daily_state.get("delivered_event_ids", []))
+            await self._audit("attempt", attempt_count=attempts, attempt_limit=attempt_limit,
+                              attempted_event_count=len(attempted), delivered_event_count=len(delivered))
             if attempts < attempt_limit:
                 daily_event = next((item for item in daily_events if (
                     str(item.get("event_id", ""))
@@ -310,15 +377,20 @@ class AgentLoop:
                 )), None)
 
         if not scheduled and not daily_event:
-            self._diagnose(session_id, (
+            no_candidate_reason = (
                 "session inactive over 7 days" if not recently_active else
                 "daily events disabled" if not self._config.daily_events_enabled else
                 "no daily events or daily attempts exhausted"
-            ), now)
+            )
+            await self._audit("candidate_availability", reason=no_candidate_reason)
+            self._diagnose(session_id, no_candidate_reason, now)
 
         candidate = self._evaluator.evaluate(
             drives, availability, now, scheduled, daily_event=daily_event
         )
+        await self._audit("candidate", decision=candidate.action_type.value,
+                          source="scheduled" if scheduled else "daily_event" if daily_event else "unfinished_context",
+                          action_id=candidate.action_id, reason=candidate.reason)
         if candidate.action_type == CandidateActionType.DO_NOTHING:
             await self._do_nothing(candidate.reason, session_id=session_id)
             return
@@ -334,6 +406,7 @@ class AgentLoop:
         allowed, cooldown_reason = await self._cooldown.check(
             user_id, candidate.topic, now, session_id=session_id
         )
+        await self._audit("cooldown", allowed=allowed, reason=cooldown_reason)
         if not allowed:
             if cooldown_reason == "daily_budget":
                 self.metrics.blocked_by_daily_budget += 1
@@ -351,6 +424,9 @@ class AgentLoop:
             candidate, drives, relationship,
             threshold_override=daily_threshold if is_daily_event else None,
         )
+        await self._audit("score", score=decision.score, decision=decision.decision,
+                          threshold=daily_threshold if is_daily_event else self._config.proactive_score_threshold,
+                          reason=decision.reason)
         self._logger.debug(
             f"PROACTIVE action_id={candidate.action_id} score={decision.score:.3f} "
             f"threshold={daily_threshold if is_daily_event else self._config.proactive_score_threshold:.3f} "
@@ -367,9 +443,12 @@ class AgentLoop:
         daily_event_id = str(candidate.metadata.get("daily_event_id", ""))
         daily_event_day = str(candidate.metadata.get("daily_event_day", ""))
         if daily_event_id and daily_event_day:
+            await self._audit("probability_start")
             daily_decision = await self._daily_policy.evaluate(
                 session_id, daily_event_day, state, daily_events, now,
             )
+            await self._audit("probability", **{k: daily_decision.get(k) for k in
+                              ("eligible", "probability", "roll", "source", "reason")})
             self._diagnose(session_id, (
                 f"daily_probability={daily_decision['probability']:.3f} "
                 f"roll={daily_decision['roll']:.3f} eligible={daily_decision['eligible']} "
@@ -408,6 +487,7 @@ class AgentLoop:
             metadata={"proactive": True, "action_id": candidate.action_id},
             payload={},
         )
+        await self._audit("memory_start")
         try:
             memories = await self._memory.recall(agent_event, perception, state, relationship)
         except Exception:
@@ -415,12 +495,16 @@ class AgentLoop:
             await self._store.save_action(candidate)
             await self._do_nothing("memory recall failed", session_id=session_id)
             return
+        await self._audit("memory", memory_count=len(memories))
 
         gate_decision = None
         if self._decision_gate is not None:
+            await self._audit("jev_start")
             gate_decision = await self._decision_gate.evaluate(
                 candidate, drives, relationship, memories, availability, agent_event.trace_id
             )
+            await self._audit("jev", decision=gate_decision.action, shadow_action=gate_decision.shadow_action,
+                              reason=gate_decision.reason)
             if gate_decision.action in {"do_nothing", "defer"}:
                 candidate.status = ActionStatus.CANCELLED
                 await self._store.save_action(candidate)
@@ -441,6 +525,7 @@ class AgentLoop:
             )
         else:
             self.metrics.proactive_planner_calls += 1
+            await self._audit("planner_start")
             plan = await self._planner.plan(
                 session_id, candidate, state, relationship, drives, memories, availability
             )
@@ -449,6 +534,8 @@ class AgentLoop:
                 self._decision_gate.record_shadow_comparison(
                     agent_event.trace_id, gate_decision.shadow_action, existing_action
                 )
+        await self._audit("planner", decision=plan.action, reason=plan.reason,
+                          source="jev" if gate_decision is not None and gate_decision.action == "send" else "planner")
         if plan.action != "proactive_message":
             candidate.status = ActionStatus.CANCELLED
             await self._store.save_action(candidate)
@@ -469,6 +556,7 @@ class AgentLoop:
             memory_ids=[item.id for item in selected], source="proactive",
         )
         history = await self._sessions.load_history(session_id)
+        await self._audit("generation_start")
         try:
             response = await self._responses.generate(
                 agent_event, perception, state, selected, action_plan,
@@ -479,6 +567,7 @@ class AgentLoop:
             await self._store.save_action(candidate)
             await self._do_nothing("response generation failed safely", session_id=session_id)
             return
+        await self._audit("generation", generated_chars=len(response.text or ""))
         if revision != await self._store.get_revision(session_id):
             candidate.status = ActionStatus.CANCELLED
             await self._store.save_action(candidate)
@@ -492,38 +581,76 @@ class AgentLoop:
         async def still_current() -> bool:
             send_now = self._clock.now()
             if revision != await self._store.get_revision(session_id):
+                await self._audit("pre_send_blocked", reason="新用户消息使发送失效")
                 return False
             if candidate.expires_at is not None and send_now > candidate.expires_at:
+                await self._audit("pre_send_blocked", reason="candidate expired")
                 return False
             if daily_event_id and (
                 not self._evaluator.in_send_window(send_now)
                 or datetime.fromtimestamp(send_now).date().isoformat() != daily_event_day
             ):
+                await self._audit("pre_send_blocked", reason="生成期间已跨日或离开发送时段")
                 return False
-            allowed, _ = await self._cooldown.check(
+            allowed, reason = await self._cooldown.check(
                 user_id, candidate.topic, send_now, session_id=session_id,
             )
+            if not allowed:
+                await self._audit("pre_send_blocked", reason=reason)
             return allowed
 
+        confirmed_text = ""
         async def record_delivered_text(text: str) -> None:
+            nonlocal confirmed_text
+            confirmed_text = text
+            if self._delivery is not None:
+                payload = self._delivery.payload(agent_event, candidate, text, response.text, selected,
+                                                 daily_event_day, daily_event_id, scheduled.id if scheduled else None)
+                await self._delivery.commit(payload)
+                await self._audit("delivery_commit")
+                return
             await self._sessions.append_and_persist(
                 session_id,
                 ConversationTurn(user_text="", assistant_text=text, timestamp=now),
             )
+            await self._audit("delivery_commit")
 
+        await self._audit("send_start")
         try:
             send_result = await self._sender.send(
                 session_id, response.text,
                 before_send=still_current,
                 on_delivered=record_delivered_text,
             )
-        except Exception:
+        except Exception as exc:
+            await self._audit("platform_error", error_type=type(exc).__name__)
             self._logger.exception("Alice proactive sender failed safely")
             send_result = False
         sent = bool(send_result)
         delivered_chunks = int(getattr(send_result, "delivered_chunks", int(sent)))
         partial = bool(getattr(send_result, "partial", False))
-        delivered = sent or partial or delivered_chunks > 0
+        delivered = sent or partial or delivered_chunks > 0 or bool(confirmed_text)
+        await self._audit("send_result", status="accepted" if sent else "partial" if delivered else "not_accepted",
+                          delivered_chunks=delivered_chunks)
+        if self._delivery is not None:
+            if delivered:
+                text = confirmed_text or getattr(send_result, "delivered_text", "")
+                if text:
+                    try:
+                        await record_delivered_text(text)
+                    except Exception as exc:
+                        await self._audit("delivery_pending", error_type=type(exc).__name__)
+                        self._logger.exception("Alice proactive local writes are pending recovery")
+                else:
+                    self._logger.warning("Alice proactive delivery has no confirmed transcript")
+                self.metrics.proactive_messages_sent += 1
+            else:
+                candidate.status = ActionStatus.CANCELLED
+                await self._store.save_action(candidate)
+                if scheduled:
+                    await self._scheduler.mark_evaluated(scheduled.id)
+                await self._do_nothing("sender rejected proactive action", session_id=session_id)
+            return
         if daily_event_id and daily_event_day and delivered:
             await self._store.record_daily_proactive_delivery(
                 session_id, daily_event_day, daily_event_id

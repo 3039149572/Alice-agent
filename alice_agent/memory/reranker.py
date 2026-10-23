@@ -1,22 +1,12 @@
 from __future__ import annotations
 
 import math
-import re
 import time
 from dataclasses import dataclass
 
 from ..domain.memory import MemoryItem, MemoryQuery, MemoryScore
 from .policies import MemoryDecayPolicy, NoDecayPolicy
-
-
-def _tokens(text: str) -> set[str]:
-    lowered = text.lower()
-    latin = set(re.findall(r"[a-z0-9_]+", lowered))
-    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", lowered))
-    grams = {cjk[index : index + 2] for index in range(max(0, len(cjk) - 1))}
-    if len(cjk) == 1:
-        grams.add(cjk)
-    return latin | grams
+from .lexical import tokens as _tokens, topic_tokens
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
@@ -65,8 +55,8 @@ class MemoryReranker:
     def _contextual_relevance(query: MemoryQuery, item: MemoryItem) -> float:
         if item.retrieval_score is not None:
             return item.retrieval_score
-        query_tokens = _tokens(f"{query.text} {query.topic}")
-        item_tokens = _tokens(f"{item.content} {item.metadata.get('topic', '')}")
+        query_tokens = _tokens(query.text) | topic_tokens(query.topic)
+        item_tokens = _tokens(item.content) | topic_tokens(item.metadata.get("topic", ""))
         return _jaccard(query_tokens, item_tokens)
 
     @staticmethod

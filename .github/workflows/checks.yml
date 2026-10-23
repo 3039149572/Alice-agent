@@ -1,0 +1,58 @@
+name: Verify plugin
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: ${{ github.workspace }}/astrbot-framework
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: AstrBotDevs/AstrBot
+          # Official v4.28.1, fixed source rather than a moving branch.
+          ref: ab42c0d9b726d82ad0f9563e04c53a4460c00d61
+          path: astrbot-framework
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the pinned framework's declared Python dependencies
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, tomllib
+          project = tomllib.loads(pathlib.Path("astrbot-framework/pyproject.toml").read_text(encoding="utf-8"))
+          pathlib.Path("framework-requirements.txt").write_text("\n".join(project["project"]["dependencies"]), encoding="utf-8")
+          PY
+          python -m pip install --prefer-binary -r framework-requirements.txt -r plugin/requirements.txt
+      - name: Check boundaries, effective defaults and build verified source ZIP
+        run: python plugin/scripts/verify_release.py --build artifacts/alice-agent-source.zip
+      - name: Unpack the tested artifact
+        run: python -m zipfile -e artifacts/alice-agent-source.zip packaged
+      - name: Run the complete suite from the unpacked package
+        working-directory: packaged
+        run: python -m unittest discover -s astrbot_plugin_alice_agent/tests -t . -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alice-agent-source-${{ runner.os }}
+          path: artifacts/alice-agent-source.zip
+          if-no-files-found: error
+          retention-days: 14

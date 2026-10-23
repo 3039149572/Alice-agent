@@ -1,0 +1,10 @@
+{"id":"zh-negation-01","task":"response_timing","stratum":"negation","reviewed":false,"input":{"text":"不是让你别回复，我是想让你认真解释。"},"expected":{"action":"reply_now"}}
+{"id":"zh-quote-01","task":"response_timing","stratum":"quotation","reviewed":false,"input":{"text":"他说‘不用回复’，但我现在想听你的看法。"},"expected":{"action":"reply_now"}}
+{"id":"zh-wait-01","task":"response_timing","stratum":"explicit_wait","reviewed":false,"input":{"text":"先别回答，我还有一段没发完。"},"expected":{"action":"wait"}}
+{"id":"zh-ignore-01","task":"response_timing","stratum":"explicit_silence","reviewed":false,"input":{"text":"这条不用回复。"},"expected":{"action":"ignore"}}
+{"id":"zh-help-01","task":"response_timing","stratum":"help_request","reviewed":false,"input":{"text":"帮我分析这段程序为什么出错。"},"expected":{"action":"reply_now"}}
+{"id":"zh-long-01","task":"planner","stratum":"explicit_detail","reviewed":false,"input":{"text":"请完整解释原因、边界和替代方案，不要只给一句结论。"},"expected":{"response_length":"long"}}
+{"id":"zh-short-01","task":"planner","stratum":"explicit_brief","reviewed":false,"input":{"text":"用一句话告诉我是否能运行。"},"expected":{"response_length":"short"}}
+{"id":"zh-emotion-01","task":"perception","stratum":"third_person","reviewed":false,"input":{"text":"他很难过，我今天倒是很平静。"},"expected":{"emotion":"neutral"}}
+{"id":"zh-irony-01","task":"perception","stratum":"irony","reviewed":false,"input":{"text":"太好了，又加班到半夜，真是开心死了。"},"expected":{"emotion":"annoyed"}}
+{"id":"zh-uncertain-01","task":"perception","stratum":"uncertainty","reviewed":false,"input":{"text":"如果我说喜欢喝咖啡，你会一直记着吗？"},"expected":{"memory_candidate":false}}

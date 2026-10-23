@@ -15,6 +15,7 @@ class InMemoryRelationshipStore:
         self._states: dict[str, RelationshipState] = {}
         self._experiences: dict[str, SharedExperience] = {}
         self._lock = asyncio.Lock()
+        self._operations: dict[str, str] = {}
 
     async def get(self, user_id: str) -> RelationshipState | None:
         async with self._lock:
@@ -28,6 +29,17 @@ class InMemoryRelationshipStore:
     async def add_shared_experience(self, experience: SharedExperience) -> None:
         async with self._lock:
             self._experiences[experience.id] = deepcopy(experience)
+
+    async def apply_once(self, user_id: str, operation_id: str, transform) -> RelationshipState:
+        async with self._lock:
+            done = self._operations.get(operation_id)
+            if done is not None and done != user_id:
+                raise ValueError("relationship operation belongs to another user")
+            if done is None:
+                old = deepcopy(self._states.get(user_id)) or RelationshipState(user_id=user_id)
+                self._states[user_id] = deepcopy(transform(old))
+                self._operations[operation_id] = user_id
+            return deepcopy(self._states[user_id])
 
     async def close(self) -> None:
         return None
@@ -73,6 +85,9 @@ class SQLiteRelationshipStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_shared_experiences_user_time
                     ON shared_experiences(user_id, timestamp DESC);
+                CREATE TABLE IF NOT EXISTS relationship_operations (
+                    operation_id TEXT PRIMARY KEY, user_id TEXT NOT NULL
+                );
                 """
             )
             self._connection.commit()
@@ -106,9 +121,12 @@ class SQLiteRelationshipStore:
         await asyncio.to_thread(self._save_sync, state)
 
     def _save_sync(self, state: RelationshipState) -> None:
-        with self._lock:
+        with self._lock, self._connection:
             self._ensure_open()
-            self._connection.execute(
+            self._save_row(state)
+
+    def _save_row(self, state: RelationshipState) -> None:
+        self._connection.execute(
                 """
                 INSERT INTO relationship_states (
                     user_id, familiarity, trust, closeness, interaction_count,
@@ -133,7 +151,23 @@ class SQLiteRelationshipStore:
                     state.last_interaction_at,
                 ),
             )
-            self._connection.commit()
+
+    async def apply_once(self, user_id: str, operation_id: str, transform) -> RelationshipState:
+        def apply():
+            with self._lock, self._connection:
+                self._ensure_open()
+                self._connection.execute("BEGIN IMMEDIATE")
+                done = self._connection.execute("SELECT user_id FROM relationship_operations WHERE operation_id=?", (operation_id,)).fetchone()
+                if done:
+                    if done[0] != user_id:
+                        raise ValueError("relationship operation belongs to another user")
+                    return self._get_sync(user_id) or RelationshipState(user_id=user_id)
+                old = self._get_sync(user_id) or RelationshipState(user_id=user_id)
+                state = transform(old)
+                self._save_row(state)
+                self._connection.execute("INSERT INTO relationship_operations VALUES (?,?)", (operation_id, user_id))
+                return state
+        return await asyncio.to_thread(apply)
 
     async def add_shared_experience(self, experience: SharedExperience) -> None:
         await asyncio.to_thread(self._add_shared_experience_sync, experience)

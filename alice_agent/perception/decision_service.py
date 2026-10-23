@@ -40,6 +40,7 @@ class DecisionAwarePerceptionService:
         vad_model: VADModelPort | None = None,
         vad_enabled: bool = True,
         jev_weight: float = 0.5,
+        affect_intervention_enabled: bool = True,
     ) -> None:
         self._existing = existing
         self._decisions = decisions
@@ -47,6 +48,7 @@ class DecisionAwarePerceptionService:
         self._vad_model = vad_model
         self._vad_enabled = bool(vad_enabled)
         self._jev_weight = min(1.0, max(0.0, float(jev_weight)))
+        self._affect_intervention_enabled = bool(affect_intervention_enabled)
 
     @staticmethod
     def _state(event: AgentEvent, history: list[ConversationTurn]) -> dict:
@@ -291,7 +293,7 @@ class DecisionAwarePerceptionService:
             *(f"social_{signal}" for signal in SOCIAL_SIGNAL_KEYS),
         )
         numeric_needs_llm = bool(
-            jev_result is not None and any(
+            self._affect_intervention_enabled and jev_result is not None and any(
                 min(jev_result.confidence, jev_result.answers[key].effective_confidence)
                 < self.NUMERIC_BLEND_THRESHOLD
                 for key in numeric_answer_keys if key in jev_result.answers
@@ -357,7 +359,7 @@ class DecisionAwarePerceptionService:
         jev_llm_scores: dict[str, float] = {}
         numeric_weights: dict[str, float] = {}
         effective_jev_scores: dict[str, float] = {}
-        if jev_result is not None and jev_scores is not None:
+        if self._affect_intervention_enabled and jev_result is not None and jev_scores is not None:
             for axis in ("valence", "arousal", "dominance"):
                 jev_value = jev_scores.get(axis)
                 if jev_value is None:
@@ -480,6 +482,7 @@ class DecisionAwarePerceptionService:
             })
 
         base.emotion_comparison = {
+            "jev_affect_intervention_enabled": self._affect_intervention_enabled,
             "schema_version": "semantic_vad_comparison_v2",
             "selected_source": selected_source,
             "selected_affect": {

@@ -15,6 +15,9 @@ class MemoryMetadataStore(Protocol):
     async def get_many(self, memory_ids: list[str]) -> dict[str, MemoryMetadata]: ...
     async def save(self, metadata: MemoryMetadata) -> None: ...
     async def record_access(self, memory_ids: list[str], accessed_at: float) -> None: ...
+    async def record_access_once(self, memory_ids: list[str], accessed_at: float, operation_id: str) -> bool: ...
+    async def delete_many(self, memory_ids: list[str]) -> None: ...
+    async def pinned_ids(self) -> list[str]: ...
     async def close(self) -> None: ...
 
 
@@ -22,6 +25,7 @@ class InMemoryMetadataStore:
     def __init__(self) -> None:
         self._items: dict[str, MemoryMetadata] = {}
         self._lock = asyncio.Lock()
+        self._access_operations: set[str] = set()
 
     async def get_many(self, memory_ids: list[str]) -> dict[str, MemoryMetadata]:
         async with self._lock:
@@ -43,6 +47,27 @@ class InMemoryMetadataStore:
                     metadata.access_count += 1
                     metadata.last_accessed_at = accessed_at
                     metadata.updated_at = accessed_at
+
+    async def delete_many(self, memory_ids: list[str]) -> None:
+        async with self._lock:
+            for memory_id in memory_ids:
+                self._items.pop(memory_id, None)
+
+    async def record_access_once(self, memory_ids: list[str], accessed_at: float, operation_id: str) -> bool:
+        async with self._lock:
+            if operation_id in self._access_operations:
+                return False
+            for memory_id in set(memory_ids):
+                if metadata := self._items.get(memory_id):
+                    metadata.access_count += 1
+                    metadata.last_accessed_at = accessed_at
+                    metadata.updated_at = accessed_at
+            self._access_operations.add(operation_id)
+            return True
+
+    async def pinned_ids(self) -> list[str]:
+        async with self._lock:
+            return [key for key, value in self._items.items() if value.pinned]
 
     async def close(self) -> None:
         return None
@@ -81,6 +106,9 @@ class SQLiteMemoryMetadataStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_memory_metadata_accessed
                     ON memory_metadata(last_accessed_at DESC);
+                CREATE TABLE IF NOT EXISTS memory_access_operations (
+                    operation_id TEXT PRIMARY KEY
+                );
                 """
             )
             self._connection.commit()
@@ -181,6 +209,35 @@ class SQLiteMemoryMetadataStore:
                 [(accessed_at, accessed_at, memory_id) for memory_id in set(memory_ids)],
             )
             self._connection.commit()
+
+    async def delete_many(self, memory_ids: list[str]) -> None:
+        def remove():
+            with self._lock, self._connection:
+                self._ensure_open()
+                self._connection.executemany("DELETE FROM memory_metadata WHERE memory_id=?", [(key,) for key in set(memory_ids)])
+        await asyncio.to_thread(remove)
+
+    async def record_access_once(self, memory_ids: list[str], accessed_at: float, operation_id: str) -> bool:
+        def apply():
+            with self._lock, self._connection:
+                self._ensure_open()
+                self._connection.execute("BEGIN IMMEDIATE")
+                if self._connection.execute("SELECT 1 FROM memory_access_operations WHERE operation_id=?", (operation_id,)).fetchone():
+                    return False
+                self._connection.executemany(
+                    "UPDATE memory_metadata SET access_count=access_count+1,last_accessed_at=?,updated_at=? WHERE memory_id=?",
+                    [(accessed_at, accessed_at, key) for key in set(memory_ids)],
+                )
+                self._connection.execute("INSERT INTO memory_access_operations VALUES (?)", (operation_id,))
+                return True
+        return await asyncio.to_thread(apply)
+
+    async def pinned_ids(self) -> list[str]:
+        def query():
+            with self._lock:
+                self._ensure_open()
+                return [row[0] for row in self._connection.execute("SELECT memory_id FROM memory_metadata WHERE pinned=1")]
+        return await asyncio.to_thread(query)
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close_sync)

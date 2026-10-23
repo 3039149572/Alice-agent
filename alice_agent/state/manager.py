@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from ..domain.event import AgentEvent
 from ..domain.perception import PerceptionResult
@@ -50,6 +50,17 @@ class StateManager:
         """Compute a proposed turn state without persisting it before delivery."""
         old_state = await self.get(event.session_id)
         return self._reducer.reduce(old_state, perception, event)
+
+    async def update_once(self, event: AgentEvent, perception: PerceptionResult, operation_id: str) -> AgentState:
+        def transform(value):
+            state = AgentState(**value) if isinstance(value, dict) else AgentState()
+            return asdict(self._reducer.reduce(state, perception, event))
+        result = await self._storage.mutate_once(self._NAMESPACE, event.session_id, operation_id, transform)
+        return AgentState(**result)
+
+    async def clear_context(self, session_id: str) -> None:
+        state = await self.get(session_id)
+        await self.commit_update(session_id, replace(state, current_topic=None, daily_events=[], topic_hooks=[]))
 
     async def commit_update(self, session_id: str, state: AgentState) -> None:
         await self._storage.set(self._NAMESPACE, session_id, asdict(state))

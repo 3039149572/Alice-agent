@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
-import re
+import uuid
+from contextlib import closing
+from datetime import datetime, timezone
 import sqlite3
 import threading
 import time
@@ -10,22 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...alice_agent.domain.memory import MemoryItem, MemoryObservation, MemoryQuery
-
-
-def _tokens(text: str) -> set[str]:
-    lowered = text.lower()
-    latin = set(re.findall(r"[a-z0-9_]+", lowered))
-    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", lowered))
-    grams = {cjk[index : index + 2] for index in range(max(0, len(cjk) - 1))}
-    if len(cjk) == 1:
-        grams.add(cjk)
-    return latin | grams
-
-
-def _overlap(left: set[str], right: set[str]) -> float:
-    if not left or not right:
-        return 0.0
-    return len(left & right) / len(left | right)
+from ...alice_agent.memory.lexical import tokens as _tokens, topic_tokens, overlap as _overlap
+from ...alice_agent.memory.facts import extract_explicit_facts, fact_query_keys
+from .fact_store import SQLiteFactVersions
+from .governance import SQLiteMemoryGovernance
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +68,19 @@ class LocalSQLiteMemoryAdapter:
             self._create_schema()
 
     def _create_schema(self) -> None:
+        version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        existing = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
+        ).fetchone()
+        if existing and version < 3 and str(self._config.database_path) != ":memory:":
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = self._config.database_path.with_name(
+                self._config.database_path.name + f".pre-v3-{stamp}-{uuid.uuid4().hex[:8]}.bak"
+            )
+            # SQLite's backup API includes committed WAL pages. Abort migration
+            # if this recovery point cannot be written; never overwrite it.
+            with closing(sqlite3.connect(backup)) as target:
+                self._connection.backup(target)
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS memories (
@@ -114,10 +118,57 @@ class LocalSQLiteMemoryAdapter:
                 ON conversation_turns(user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_turns_session_created
                 ON conversation_turns(session_id, created_at DESC);
-            PRAGMA user_version=1;
+            CREATE TABLE IF NOT EXISTS memory_search_documents (
+                memory_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS memory_search_terms (
+                memory_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                term TEXT NOT NULL,
+                PRIMARY KEY(memory_id, kind, term)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_search_terms_lookup
+                ON memory_search_terms(kind, term, memory_id);
+            CREATE TEMP TABLE IF NOT EXISTS recall_terms (
+                kind TEXT NOT NULL, term TEXT NOT NULL, PRIMARY KEY(kind, term)
+            );
             """
         )
-        self._connection.commit()
+        self._facts = SQLiteFactVersions(
+            self._connection, self._config.scope, self._upsert_item, self._get_sync,
+        )
+        self._facts.create_schema()
+        self._data = SQLiteMemoryGovernance(
+            self._connection, self._config.scope, self._row_to_item, self._upsert_item, self._facts,
+        )
+        self._data.create_schema()
+        # The document marker includes empty-token records, so startup does not
+        # repeatedly backfill them. Index and content updates share a transaction.
+        with self._connection:
+            rows = self._connection.execute(
+                "SELECT m.* FROM memories m LEFT JOIN memory_search_documents d "
+                "ON d.memory_id=m.id WHERE d.memory_id IS NULL"
+            ).fetchall()
+            for row in rows:
+                item = self._row_to_item(row)
+                self._index_item(item)
+            version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+            if version < 3:
+                self._connection.execute("PRAGMA user_version=3")
+
+    def _index_item(self, item: MemoryItem) -> None:
+        self._connection.execute("DELETE FROM memory_search_terms WHERE memory_id=?", (item.id,))
+        terms = [(item.id, "content", term) for term in sorted(_tokens(item.content))]
+        terms.extend((item.id, "topic", term) for term in sorted(topic_tokens(item.metadata.get("topic", ""))))
+        fact_key = item.metadata.get("fact_key")
+        if isinstance(fact_key, str):
+            terms.extend((item.id, "fact", term) for term in sorted({fact_key, fact_key.split("/", 1)[0]}))
+        self._connection.executemany(
+            "INSERT INTO memory_search_terms(memory_id,kind,term) VALUES (?,?,?)", terms,
+        )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO memory_search_documents(memory_id) VALUES (?)", (item.id,),
+        )
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -139,6 +190,7 @@ class LocalSQLiteMemoryAdapter:
             metadata = {}
         if not isinstance(metadata, dict):
             metadata = {}
+        metadata.update(user_id=str(row["user_id"]), session_id=str(row["session_id"]))
         return MemoryItem(
             id=str(row["id"]),
             content=str(row["content"]),
@@ -163,33 +215,53 @@ class LocalSQLiteMemoryAdapter:
         return await asyncio.to_thread(self._recall_sync, query)
 
     def _recall_sync(self, query: MemoryQuery) -> list[MemoryItem]:
-        with self._thread_lock:
+        with self._thread_lock, self._connection:
             self._ensure_open()
             column = "user_id" if self._config.scope == "user" else "session_id"
             value = query.user_id if self._config.scope == "user" else query.session_id
-            rows = self._connection.execute(
-                f"SELECT * FROM memories WHERE {column} = ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (value, self._config.candidate_limit),
-            ).fetchall()
-
             query_tokens = _tokens(query.text)
-            topic_tokens = _tokens(query.topic)
-            scored: list[tuple[float, MemoryItem]] = []
-            for row in rows:
-                item = self._row_to_item(row)
-                lexical = _overlap(query_tokens, _tokens(item.content))
-                topic = _overlap(topic_tokens, _tokens(str(item.metadata.get("topic", ""))))
-                if lexical <= 0.0 and topic <= 0.0:
-                    continue
-                relevance = 0.8 * lexical + 0.2 * topic
-                if relevance >= self._config.min_score:
-                    item.retrieval_score = relevance
-                    scored.append((relevance, item))
-
-            scored.sort(key=lambda pair: (pair[0], pair[1].created_at), reverse=True)
-            selected = [item for _, item in scored[: query.limit]]
-            return selected
+            query_topics = topic_tokens(query.topic)
+            query_facts = fact_query_keys(query.text)
+            self._connection.execute("DELETE FROM recall_terms")
+            self._connection.executemany(
+                "INSERT INTO recall_terms(kind,term) VALUES (?,?)",
+                [("content", term) for term in sorted(query_tokens)]
+                + [("topic", term) for term in sorted(query_topics)],
+            )
+            self._connection.executemany(
+                "INSERT INTO recall_terms(kind,term) VALUES (?,?)",
+                [("fact", term) for term in sorted(query_facts)],
+            )
+            # The index selects matches throughout the user's/session's entire
+            # history. candidate_limit is a fetch batch, never a recency cutoff.
+            cursor = self._connection.execute(
+                "SELECT DISTINCT m.* FROM recall_terms q "
+                "JOIN memory_search_terms t ON t.kind=q.kind AND t.term=q.term "
+                "JOIN memories m ON m.id=t.memory_id "
+                "LEFT JOIN memory_fact_versions f ON f.memory_id=m.id "
+                f"WHERE m.{column}=? AND (f.status IS NULL OR f.status='active')", (value,),
+            )
+            best: list[tuple[float, float, str, MemoryItem]] = []
+            while rows := cursor.fetchmany(self._config.candidate_limit):
+                for row in rows:
+                    item = self._row_to_item(row)
+                    lexical = _overlap(query_tokens, _tokens(item.content))
+                    topic = _overlap(query_topics, topic_tokens(item.metadata.get("topic", "")))
+                    key = str(item.metadata.get("fact_key", ""))
+                    fact_match = bool(query_facts & {key, key.split("/", 1)[0]})
+                    if lexical <= 0.0 and topic <= 0.0 and not fact_match:
+                        continue
+                    relevance = 0.8 * lexical + 0.2 * topic
+                    if fact_match:
+                        relevance = max(relevance, 0.8)
+                    if relevance >= self._config.min_score:
+                        item.retrieval_score = relevance
+                        entry = (relevance, float(item.created_at or 0.0), item.id, item)
+                        if len(best) < query.limit:
+                            heapq.heappush(best, entry)
+                        else:
+                            heapq.heappushpop(best, entry)
+            return [entry[3] for entry in sorted(best, reverse=True)]
 
     async def observe(self, observation: MemoryObservation) -> bool:
         return await asyncio.to_thread(self._observe_sync, observation)
@@ -197,7 +269,7 @@ class LocalSQLiteMemoryAdapter:
     def _observe_sync(self, observation: MemoryObservation) -> bool:
         item = observation.item
         user_id, session_id, trace_id = self._metadata(item)
-        with self._thread_lock:
+        with self._thread_lock, self._connection:
             self._ensure_open()
             wrote_turn = False
             if self._config.capture_all_turns:
@@ -217,9 +289,13 @@ class LocalSQLiteMemoryAdapter:
                 wrote_turn = cursor.rowcount > 0
             wrote_memory = False
             if observation.persist_candidate:
-                self._upsert_item(item, require_existing=False)
+                claims = extract_explicit_facts(item.content) if item.metadata.get("extract_explicit_facts") is True else []
+                if claims:
+                    observation.persisted_items = self._facts.apply(item, claims)
+                else:
+                    self._upsert_item(item, require_existing=False)
+                    observation.persisted_items = [item]
                 wrote_memory = True
-            self._connection.commit()
             return wrote_turn or wrote_memory
 
     def _upsert_item(self, item: MemoryItem, *, require_existing: bool) -> None:
@@ -253,19 +329,19 @@ class LocalSQLiteMemoryAdapter:
             (
                 item.id, user_id, session_id, item.content, item.memory_type,
                 item.importance, item.emotional_weight, item.relationship_weight,
-                item.confidence, item.created_at or time.time(), item.last_accessed_at,
+                item.confidence, item.created_at if item.created_at is not None else time.time(), item.last_accessed_at,
                 metadata_json, time.time(),
             ),
         )
+        self._index_item(item)
 
     async def update(self, item: MemoryItem) -> None:
         await asyncio.to_thread(self._update_sync, item)
 
     def _update_sync(self, item: MemoryItem) -> None:
-        with self._thread_lock:
+        with self._thread_lock, self._connection:
             self._ensure_open()
             self._upsert_item(item, require_existing=True)
-            self._connection.commit()
 
     async def get(self, memory_id: str) -> MemoryItem | None:
         return await asyncio.to_thread(self._get_sync, memory_id)
@@ -277,6 +353,16 @@ class LocalSQLiteMemoryAdapter:
                 "SELECT * FROM memories WHERE id = ?", (memory_id,)
             ).fetchone()
             return self._row_to_item(row) if row is not None else None
+
+    async def manage(self, operation: str, *args, **kwargs):
+        if operation not in {"list", "journal", "show", "preview", "delete", "correct", "prune", "jobs", "finish"}:
+            raise ValueError("unknown memory data operation")
+        return await asyncio.to_thread(self._manage_sync, operation, args, kwargs)
+
+    def _manage_sync(self, operation, args, kwargs):
+        with self._thread_lock, self._connection:
+            self._ensure_open()
+            return getattr(self._data, operation)(*args, **kwargs)
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close_sync)

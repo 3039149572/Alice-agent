@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from dataclasses import asdict
@@ -22,6 +23,9 @@ from ..relationship.manager import RelationshipManager
 from ..relationship.models import RelationshipState, relationship_summary
 from ..state.manager import StateManager
 from .session_manager import SessionManager
+from ..runtime import turn_budget, current_budget, measured
+from ..async_utils import finish_before_cancelling
+from .delivery_commit import DeliveryCommitCoordinator
 
 
 class AgentPipeline:
@@ -39,6 +43,8 @@ class AgentPipeline:
         relationship_manager: RelationshipManager | None = None,
         media_selector: DecisionAwareMediaSelector | None = None,
         daily_events: object | None = None,
+        data_service: object | None = None,
+        delivery_journal: object | None = None,
     ) -> None:
         self._config = config
         self._perception = perception
@@ -51,6 +57,8 @@ class AgentPipeline:
         self._relationship = relationship_manager
         self._media_selector = media_selector
         self._daily_events = daily_events
+        self._data_service = data_service
+        self._delivery = DeliveryCommitCoordinator(delivery_journal, state_manager, memory, session_manager, relationship_manager) if delivery_journal is not None else None
 
     def _detail(self, trace_id: str, stage: str, value: Any) -> None:
         if self._config.debug:
@@ -162,6 +170,51 @@ class AgentPipeline:
         *,
         is_current: Callable[[], Awaitable[bool]] | None = None,
     ) -> AgentResponse:
+        now = time.monotonic()
+        deadline = now + self._config.turn_timeout
+        supplied = event.metadata.get("_turn_deadline_monotonic")
+        if isinstance(supplied, (int, float)) and not isinstance(supplied, bool) and math.isfinite(supplied):
+            deadline = min(deadline, float(supplied))
+        parent = current_budget()
+        if parent:
+            deadline = min(deadline, parent.deadline)
+        with turn_budget(deadline) as budget:
+            timer = asyncio.timeout(max(0.0, deadline - now))
+            try:
+                async with timer:
+                    response = await measured("generation_total", self._handle_event(event, is_current=is_current))
+            except TimeoutError:
+                if not timer.expired():
+                    raise
+                response = AgentResponse(
+                    text=self._config.fallback_text, trace_id=event.trace_id,
+                    metadata={"fallback": True, "turn_budget_exhausted": True},
+                )
+            diagnostics = response.metadata.setdefault("turn_diagnostics", {})
+            diagnostics["stage_latency_ms"] = {key: round(value, 3) for key, value in budget.latency_ms.items()}
+            diagnostics["turn_budget_exhausted"] = timer.expired()
+            return response
+
+    async def _handle_event(
+        self,
+        event: AgentEvent,
+        *,
+        is_current: Callable[[], Awaitable[bool]] | None = None,
+    ) -> AgentResponse:
+        if self._data_service is None:
+            return await self._handle_event_with_data(event, is_current=is_current)
+        self._data_service.stamp(event)
+        async with self._data_service.guard(event.user_id):
+            if not self._data_service.is_current(event):
+                return self._superseded_response(event)
+            return await self._handle_event_with_data(event, is_current=is_current)
+
+    async def _handle_event_with_data(
+        self,
+        event: AgentEvent,
+        *,
+        is_current: Callable[[], Awaitable[bool]] | None = None,
+    ) -> AgentResponse:
         started = time.perf_counter()
         trace = event.trace_id
         self._logger.info(
@@ -175,9 +228,9 @@ class AgentPipeline:
             today_events: list[dict[str, Any]] = []
             if self._daily_events is not None:
                 try:
-                    today_events = await self._daily_events.ensure(
+                    today_events = await measured("daily_events", self._daily_events.ensure(
                         event.session_id, event.user_id, event.timestamp, history
-                    )
+                    ))
                 except Exception:
                     self._logger.exception(f"[{trace}] ERROR stage=DAILY EVENTS")
             if not await self._is_current(is_current):
@@ -195,7 +248,7 @@ class AgentPipeline:
             self._detail(trace, "STATE BEFORE", asdict(state_before))
 
             try:
-                perception = await self._perception.analyze(event, history)
+                perception = await measured("perception", self._perception.analyze(event, history))
             except Exception:
                 self._logger.exception(f"[{trace}] ERROR stage=PERCEPTION")
                 perception = PerceptionResult.fallback()
@@ -238,9 +291,9 @@ class AgentPipeline:
             )
 
             try:
-                memories = await self._memory.recall(
+                memories = await measured("memory", self._memory.recall(
                     event, perception, state_after, relationship
-                )
+                ))
             except Exception:
                 self._logger.exception(f"[{trace}] ERROR stage=MEMORY RETRIEVED")
                 memories = []
@@ -250,9 +303,9 @@ class AgentPipeline:
             self._detail(trace, "MEMORY RETRIEVED DETAIL", [item.id for item in memories])
 
             try:
-                plan = await self._planner.plan(
+                plan = await measured("planner", self._planner.plan(
                     event, perception, state_after, memories, history, relationship
-                )
+                ))
             except Exception:
                 self._logger.exception(f"[{trace}] ERROR stage=ACTION PLAN")
                 plan = ActionPlan.fallback()
@@ -293,10 +346,10 @@ class AgentPipeline:
 
             response_failed = False
             try:
-                response = await self._response_generator.generate(
+                response = await measured("response", self._response_generator.generate(
                     event, perception, state_after, selected_memories, plan,
                     history, relationship
-                )
+                ))
             except Exception:
                 response_failed = True
                 self._logger.exception(f"[{trace}] ERROR stage=LLM RESPONSE")
@@ -317,9 +370,9 @@ class AgentPipeline:
 
             if self._media_selector is not None and response.text:
                 try:
-                    response.metadata["media_decision"] = await self._media_selector.decide(
+                    response.metadata["media_decision"] = await measured("media_selection", self._media_selector.decide(
                         event, response, perception, state_after, plan
-                    )
+                    ))
                     media = response.metadata["media_decision"]
                     self._logger.info(
                         f"[{trace}] MEDIA DECISION source={media.source} "
@@ -398,6 +451,13 @@ class AgentPipeline:
     async def _commit_delivery_locked(
         self, event: AgentEvent, response: AgentResponse, delivered_text: str
     ) -> None:
+        if self._delivery is not None:
+            try:
+                await finish_before_cancelling(self._delivery.commit(event, response, delivered_text))
+            except Exception:
+                response.metadata["_alice_delivery_pending"] = True
+                self._logger.exception("Alice delivered transcript has pending local writes; recovery will retry")
+            return
         pending = response.metadata.pop("_alice_pending_commit", None)
         if not isinstance(pending, dict):
             if response.metadata.get("_alice_delivery_committed"):
@@ -464,13 +524,30 @@ class AgentPipeline:
     async def commit_delivery(
         self, event: AgentEvent, response: AgentResponse, delivered_text: str
     ) -> None:
+        if self._data_service is not None:
+            async with self._data_service.guard(event.user_id):
+                if self._data_service.is_current(event):
+                    async with self._session_manager.lock(event.session_id):
+                        await self._commit_delivery_locked(event, response, delivered_text)
+            return
         async with self._session_manager.lock(event.session_id):
             await self._commit_delivery_locked(event, response, delivered_text)
 
     async def record_suppressed(
         self, event: AgentEvent, diagnostics: dict[str, object]
     ) -> None:
+        if self._data_service is not None:
+            async with self._data_service.guard(event.user_id):
+                if self._data_service.is_current(event):
+                    await self._record_suppressed(event, diagnostics)
+            return
+        await self._record_suppressed(event, diagnostics)
+
+    async def _record_suppressed(self, event, diagnostics) -> None:
         async with self._session_manager.lock(event.session_id):
+            if self._delivery is not None:
+                await self._commit_delivery_locked(event, AgentResponse(None, event.trace_id, "ignore"), "")
+                return
             await self._session_manager.append_and_persist(
                 event.session_id,
                 ConversationTurn(
@@ -480,9 +557,33 @@ class AgentPipeline:
                 ),
             )
 
+    async def recover_deliveries(self, user_id=None) -> None:
+        if self._delivery is None:
+            return
+        async def apply(operation_id, payload):
+            async with self._session_manager.lock(payload["event"]["session_id"]):
+                # A pending snapshot can have completed while waiting for the
+                # user/session locks. Never replay it after an intervening erase.
+                live = dict(await self._delivery.journal.pending(payload["event"]["user_id"]))
+                if operation_id in live:
+                    await finish_before_cancelling(self._delivery.apply(operation_id, live[operation_id]))
+        for operation_id, payload in await self._delivery.journal.pending(user_id):
+            try:
+                if self._data_service is None:
+                    await apply(operation_id, payload)
+                else:
+                    async with self._data_service.guard(payload["event"]["user_id"], recover_jobs=False):
+                        await apply(operation_id, payload)
+            except Exception:
+                if user_id is not None:
+                    raise
+                self._logger.exception("Alice pending delivery will retry; continuing other users' recovery")
+
     async def close(self) -> None:
         await self._memory.close()
         await self._state_manager.close()
         if self._relationship is not None:
             await self._relationship.close()
         await self._session_manager.close()
+        if self._delivery is not None:
+            await self._delivery.journal.close()

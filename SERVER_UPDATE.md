@@ -1,5 +1,19 @@
 # 服务器安装与更新
 
+## v0.9.2 更新
+
+从 [v0.9.2 Release](https://github.com/3039149572/Alice-agent/releases/tag/v0.9.2) 下载验证后的 `alice-agent-source.zip`，或通过本仓库在AstrBot中更新/重新安装，然后重载插件。本版合并此前未发布、曾标记为0.10.0的本地修复；0.10.0从未作为远端Release发布。当前范围和验证结果见 `docs/REPAIR_PROGRESS.md`。
+
+重载后查看插件数据目录的 `proactive_today.log`，通常为 `data/plugin_data/astrbot_plugin_alice_agent/proactive_today.log`。同日追加、重启保留；按服务器本地日期跨日覆盖，插件运行期间最迟下一次60秒检查换日。无需开启聊天诊断开关。具体阶段、原因和时区见 [诊断文件说明](docs/PROACTIVE_LOG.md)。发布GitHub并不代表服务器已经更新/重载。
+
+本版声明AstrBot `>=4.28.1,<5`。正式升级前停止插件，备份实例配置和整个插件数据目录（包含新 `alice_operations.db`、全部SQLite数据库及相关WAL/SHM文件）；素材另行保留。已有记忆库迁移前自动保存SQLite备份，备份失败不继续迁移。先在测试实例安装验证包，重载后检查实际源码/版本，再做真实模型、Genie与QQ验收。
+
+新保留配置默认0，不主动清空旧记忆。默认文字先发、媒体上限12秒、生成预算60秒，Jev数值情绪干预默认false；已有显式配置优先。用户命令与保留范围见 `docs/DATA_GOVERNANCE.md`。
+
+回退不能用旧检索逻辑直接打开新事实库。停止插件后恢复对应迁移前备份，并保留当前整套实例数据供恢复备份之后的新记录；未完成交付意图不能当作普通日志删除。没有生产升级前，不执行这些替换操作。
+
+## 以下为v0.9.1历史安装参考
+
 源码仓库：https://github.com/3039149572/Alice-agent
 
 v0.9.1 包含主动分享链路修复、心情/每日事件驱动的当天概率，以及此前的整合骑士角色知识与精选对白。源码、配置字段定义、提示词、测试和 `alice_agent/knowledge/data/` 静态资料随版本发布；聊天记录、密钥、实例配置、音频和表情素材独立保管。角色知识配置见 `docs/NOVEL_CONTEXT.md`。

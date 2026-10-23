@@ -131,7 +131,8 @@ class SessionManager:
         history = self._histories.setdefault(
             session_id, deque(maxlen=self._history_limit)
         )
-        history.append(turn)
+        if not turn.delivery_id or all(item.delivery_id != turn.delivery_id for item in history):
+            history.append(turn)
 
     async def load_history(self, session_id: str) -> list[ConversationTurn]:
         if self._history_limit <= 0:
@@ -201,18 +202,20 @@ class SessionManager:
         for item in snapshot["turns"][-max_scan:]:
             if (
                 not isinstance(item, dict)
-                or set(item) != {"user_text", "assistant_text", "timestamp"}
+                or set(item) not in ({"user_text", "assistant_text", "timestamp"}, {"user_text", "assistant_text", "timestamp", "delivery_id"})
             ):
                 invalid_entry = True
                 continue
             user_text = item.get("user_text")
             assistant_text = item.get("assistant_text")
             timestamp = _finite_number(item.get("timestamp"))
+            delivery_id = item.get("delivery_id")
             if (
                 not isinstance(user_text, str)
                 or (assistant_text is not None and not isinstance(assistant_text, str))
                 or timestamp is None
                 or timestamp > now + _MAX_FUTURE_SKEW_SECONDS
+                or (delivery_id is not None and (not isinstance(delivery_id, str) or len(delivery_id) > 128))
             ):
                 invalid_entry = True
                 continue
@@ -225,6 +228,7 @@ class SessionManager:
                     if assistant_text is not None else None
                 ),
                 timestamp=timestamp,
+                delivery_id=delivery_id,
             ))
 
         if invalid_entry:
@@ -234,7 +238,7 @@ class SessionManager:
         return restored[-min(self._history_limit, _MAX_PERSISTED_TURNS):]
 
     async def append_and_persist(
-        self, session_id: str, turn: ConversationTurn
+        self, session_id: str, turn: ConversationTurn, *, strict: bool = False
     ) -> None:
         if self._history_limit <= 0:
             return
@@ -242,6 +246,8 @@ class SessionManager:
             self.append(session_id, turn)
             return
         async with self._io_locks[session_id]:
+            if strict and session_id not in self._writable_sessions:
+                self._loaded_sessions.discard(session_id)
             await self._load_locked(session_id)
             now = self._now()
             self._prune_history(session_id, now)
@@ -250,12 +256,15 @@ class SessionManager:
             history = self._histories.setdefault(
                 session_id, deque(maxlen=self._history_limit)
             )
-            history.append(turn)
+            if not turn.delivery_id or all(item.delivery_id != turn.delivery_id for item in history):
+                history.append(turn)
             if session_id not in self._writable_sessions:
+                if strict:
+                    raise OSError("session history is unreadable; commit will retry")
                 return
-            await self._persist_locked(session_id)
+            await self._persist_locked(session_id, strict=strict)
 
-    async def _persist_locked(self, session_id: str) -> None:
+    async def _persist_locked(self, session_id: str, *, strict: bool = False) -> None:
         if self._storage is None or session_id not in self._writable_sessions:
             return
         now = self._now()
@@ -272,6 +281,7 @@ class SessionManager:
                         if turn.assistant_text is not None else None
                     ),
                     "timestamp": float(turn.timestamp),
+                    **({"delivery_id": turn.delivery_id} if turn.delivery_id else {}),
                 }
                 for turn in recent
             ],
@@ -310,6 +320,8 @@ class SessionManager:
         if write_error is not None:
             if isinstance(write_error, asyncio.CancelledError):
                 raise write_error
+            if strict:
+                raise write_error
             self._logger.warning(
                 f"Alice session history write failed ({type(write_error).__name__})"
             )
@@ -317,6 +329,37 @@ class SessionManager:
     @staticmethod
     def _storage_key(session_id: str) -> str:
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+    async def forget(self, session_id: str) -> None:
+        """Erase the cached and persisted snapshot after a data-management action.
+
+        The caller holds its user data gate, so a pending generation/delivery
+        cannot subsequently write a snapshot made before this invalidation.
+        """
+        async with self._io_locks[session_id]:
+            if self._storage is not None:
+                await self._storage.delete(_HISTORY_NAMESPACE, self._storage_key(session_id))
+            self._histories.pop(session_id, None)
+            self._loaded_sessions.discard(session_id)
+            self._writable_sessions.discard(session_id)
+
+    async def maintenance(self) -> None:
+        """Expire persisted snapshots even when their sessions never return."""
+        if self._storage is None or not hasattr(self._storage, "transform_namespace"):
+            return
+        now = self._now()
+        def prune(snapshot):
+            if not isinstance(snapshot, dict) or snapshot.get("schema_version") != _HISTORY_SCHEMA or not isinstance(snapshot.get("turns"), list):
+                return snapshot
+            turns = []
+            for turn in snapshot["turns"]:
+                stamp = _finite_number(turn.get("timestamp")) if isinstance(turn, dict) else None
+                if stamp is not None and now - self._max_age_seconds <= stamp <= now + _MAX_FUTURE_SKEW_SECONDS:
+                    turns.append(turn)
+            return {**snapshot, "turns": turns} if turns else None
+        await self._storage.transform_namespace(_HISTORY_NAMESPACE, prune)
+        for session_id in tuple(self._histories):
+            self._prune_history(session_id, now)
 
     async def close(self) -> None:
         async with self._close_lock:

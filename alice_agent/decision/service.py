@@ -32,11 +32,13 @@ class DecisionService:
         cache_limit: int = 256,
         metrics_storage: StoragePort | None = None,
         metrics_flush_seconds: float = 30.0,
+        task_policies: dict[str, Any] | None = None,
     ) -> None:
         self._port = port
         self.mode = mode
         self.model = model
         self.policy = policy or DecisionEscalationPolicy()
+        self._task_policies = dict(task_policies or {})
         self.metrics = DecisionMetrics()
         self._logger = logger or NullLogger()
         self._cache_ttl = max(0.0, cache_ttl_seconds)
@@ -60,6 +62,8 @@ class DecisionService:
             try:
                 payload = await self._metrics_storage.get("decision_metrics", "totals")
                 self.metrics.restore(payload)
+                if isinstance(payload, dict) and payload.get("schema_version") == 1:
+                    self.metrics.restore_groups(payload.get("groups"))
             except Exception as exc:
                 # A failed read must not overwrite counters we could not load.
                 self._metrics_writable = False
@@ -77,6 +81,7 @@ class DecisionService:
                 await self._metrics_storage.set("decision_metrics", "totals", {
                     "schema_version": 1,
                     "buckets": self.metrics.snapshot(),
+                    "groups": self.metrics.grouped_snapshot(derived=False),
                 })
             except Exception as exc:
                 self._logger.warning(f"Alice decision metrics save failed ({type(exc).__name__})")
@@ -90,7 +95,28 @@ class DecisionService:
 
     @property
     def enabled(self) -> bool:
-        return self.mode != DecisionMode.OFF and self._port is not None
+        return self._port is not None and (
+            self.mode != DecisionMode.OFF or any(self.mode_for(task) != DecisionMode.OFF for task in self._task_policies)
+        )
+
+    def mode_for(self, task: str) -> DecisionMode:
+        value = self._task_policies.get(task, {}).get("mode", self.mode)
+        try:
+            return DecisionMode(value)
+        except ValueError:
+            return self.mode
+
+    def policy_for(self, task: str) -> DecisionEscalationPolicy:
+        settings = self._task_policies.get(task, {})
+        def number(key, default):
+            value = settings.get(key, default)
+            return float(value) if type(value) in (float, int) and math.isfinite(value) else default
+        review = max(0.80, number("review_threshold", self.policy.review_threshold))
+        auto = max(review, number("auto_threshold", self.policy.auto_threshold))
+        return DecisionEscalationPolicy(auto_threshold=min(1.0, auto), review_threshold=min(1.0, review))
+
+    def for_task(self, task: str):
+        return TaskDecisionService(self, task)
 
     @staticmethod
     def _canonical(value: Any) -> str:
@@ -112,6 +138,8 @@ class DecisionService:
             "schema_version": schema_version,
             "state_hash": input_hash,
             "questions": schema_payload,
+            "mode": self.mode_for(decision_type).value,
+            "policy": [self.policy_for(decision_type).auto_threshold, self.policy_for(decision_type).review_threshold],
         })
         return hashlib.sha256(raw.encode("utf-8")).hexdigest(), input_hash
 
@@ -157,7 +185,8 @@ class DecisionService:
     ) -> DecisionResult | None:
         await self.start()
         attempt_started = time.perf_counter()
-        if not self.enabled:
+        mode, policy = self.mode_for(decision_type), self.policy_for(decision_type)
+        if self._port is None or mode == DecisionMode.OFF:
             if attempt_diagnostics is not None:
                 attempt_diagnostics.update({
                     "status": "disabled",
@@ -190,7 +219,7 @@ class DecisionService:
                 })
             self._logger.debug(
                 f"[{trace_id}] JEV TRACE id={decision_id} type={decision_type} "
-                f"schema={schema_version} model={self.model} mode={self.mode.value} "
+                f"schema={schema_version} model={self.model} mode={mode.value} "
                 f"cached=true input_hash={input_hash[:12]}"
             )
             return result
@@ -198,6 +227,7 @@ class DecisionService:
         bucket.calls += 1
         started = time.perf_counter()
         resolved_model = self.model
+        call_status, call_usage = "cancelled", {}
         try:
             result = await self._port.decide(
                 state, questions,
@@ -210,7 +240,7 @@ class DecisionService:
             self._validate(result, questions)
             result.confidence = self._confidence(result)
             result.input_hash = input_hash
-            result.mode = self.mode.value
+            result.mode = mode.value
             if attempt_diagnostics is not None:
                 attempt_diagnostics.update({
                     "status": "ok",
@@ -223,10 +253,11 @@ class DecisionService:
                     "decision_id": decision_id,
                     "usage": dict(result.usage),
                 })
-            level = self.policy.classify(result.confidence)
+            level = policy.classify(result.confidence)
             setattr(bucket, f"{level}_confidence", getattr(bucket, f"{level}_confidence") + 1)
             bucket.input_tokens += int(result.usage.get("input_tokens", 0))
             bucket.output_tokens += int(result.usage.get("output_tokens", 0))
+            call_status, call_usage = "ok", dict(result.usage)
             answer_summary = {
                 key: {
                     "type": answer.type,
@@ -248,6 +279,7 @@ class DecisionService:
                     self._cache.popitem(last=False)
             return result
         except DecisionTimeoutError:
+            call_status = "timeout"
             bucket.timeouts += 1
             bucket.fallbacks += 1
             self._logger.warning(
@@ -261,6 +293,7 @@ class DecisionService:
                 })
             return None
         except Exception as exc:
+            call_status = "error"
             bucket.errors += 1
             bucket.fallbacks += 1
             self._logger.warning(
@@ -281,9 +314,10 @@ class DecisionService:
                     time.perf_counter() - attempt_started
                 ) * 1000.0
             bucket.latency_total_ms += latency
+            self.metrics.record_group(decision_type, resolved_model, mode.value, latency, call_status, call_usage)
             self._logger.debug(
                 f"[{trace_id}] JEV TRACE type={decision_type} schema={schema_version} "
-                f"id={decision_id} model={resolved_model} mode={self.mode.value} latency_ms={latency:.1f} "
+                f"id={decision_id} model={resolved_model} mode={mode.value} latency_ms={latency:.1f} "
                 f"input_hash={input_hash[:12]}"
             )
 
@@ -331,3 +365,30 @@ class DecisionService:
             finally:
                 if self._metrics_storage is not None:
                     await self._metrics_storage.close()
+
+
+class TaskDecisionService:
+    """Task-local policy view sharing transport, cache, metrics and lifecycle."""
+
+    def __init__(self, owner: DecisionService, task: str):
+        self.owner, self.task = owner, task
+
+    @property
+    def mode(self):
+        return self.owner.mode_for(self.task)
+
+    @property
+    def policy(self):
+        return self.owner.policy_for(self.task)
+
+    @property
+    def enabled(self):
+        return self.mode != DecisionMode.OFF and self.owner._port is not None
+
+    async def decide(self, *args, **kwargs):
+        if kwargs.get("decision_type") != self.task:
+            raise ValueError("Decision task view used for a different task")
+        return await self.owner.decide(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.owner, name)

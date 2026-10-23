@@ -80,6 +80,27 @@ class AtomicJSONTurnLogger:
         trace = re.sub(r"[^A-Za-z0-9_.-]", "_", str(record.get("trace_id", "turn")))[:80] or "turn"
         return f"{stamp}_{trace}_{uuid4().hex[:8]}.json"
 
+    def delete_user(self, user_id: str, session_id: str | None = None) -> int:
+        """Delete only this logger's valid, owned records in its configured folder."""
+        removed = 0
+        base = self._directory.resolve()
+        with self._cleanup_lock:
+            for path in self._directory.glob("*.json"):
+                if not re.fullmatch(r"\d{8}T\d{6}_\d{6}Z_[A-Za-z0-9_.-]{1,80}_[0-9a-f]{8}\.json", path.name):
+                    continue
+                if path.is_symlink() or path.resolve().parent != base or not path.is_file():
+                    continue
+                try:
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    continue
+                if (isinstance(record, dict) and record.get("schema_version") == "alice_turn_test_v1"
+                        and record.get("user_id") == user_id
+                        and (session_id is None or record.get("session_id") == session_id)):
+                    path.unlink()
+                    removed += 1
+        return removed
+
     def write(
         self,
         record: dict[str, Any],

@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+from contextlib import aclosing
 import json
-import math
 import os
-import time
-import weakref
 from collections import OrderedDict, defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
-import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
@@ -23,12 +18,15 @@ from .adapters.astrbot import (
     AstrBotMessageAdapter,
     AstrBotProactiveSender,
 )
+from .adapters.astrbot.reactive import ReactiveMessageMixin
+from .adapters.astrbot.reply_delivery import ReplyDeliveryMixin
+from .adapters.astrbot.send_coordinator import SessionSendCoordinator
+from .adapters.astrbot.config_values import _finite_float, _positive_int
 from .adapters.memory import build_memory_port
 from .adapters.jev import DEFAULT_SYSTEMONE_ENDPOINT, TypesafeJevAdapter
 from .adapters.storage import InMemoryStorageAdapter, SQLiteStorageAdapter
 from .adapters.vad import HTTPVADModelAdapter
-from .adapters.diagnostics import AtomicJSONTurnLogger
-from .adapters.astrbot.text_segments import split_text
+from .adapters.diagnostics import AtomicJSONTurnLogger, DailyProactiveLogger
 from .alice_agent.config import AgentConfig
 from .alice_agent.core.agent import AliceAgent
 from .alice_agent.core.pipeline import AgentPipeline
@@ -78,47 +76,12 @@ from .alice_agent.decision.models import DecisionMode
 from .alice_agent.decision.policies import DecisionEscalationPolicy
 from .alice_agent.decision.service import DecisionService
 from .alice_agent.decision.response_timing import ResponseTimingService
-from .alice_agent.decision.response_timing import ReplyTimingDecision
-from .alice_agent.domain.response import AgentResponse
-from .alice_agent.domain.event import AgentEvent
 from .adapters.astrbot.pending_messages import (
-    PendingMessage,
-    PendingReplyBatch,
     PendingReplyCoordinator,
 )
 from .alice_agent.memory.decision_gate import MemoryDecisionGate
 from .alice_agent.perception.decision_service import DecisionAwarePerceptionService
 from .alice_agent.planner.decision_service import DecisionAwarePlannerService
-
-
-class SessionSendCoordinator:
-    """Share one short-lived send lock per active session."""
-
-    def __init__(self) -> None:
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-
-    def lock_for(self, session_id: str) -> asyncio.Lock:
-        lock = self._locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[session_id] = lock
-        return lock
-
-
-def _finite_float(value: object, default: float) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    return number if math.isfinite(number) else default
-
-
-def _positive_int(value: object, default: int) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    return max(1, number)
 
 
 def _parse_persona_profile(value: object) -> dict:
@@ -135,10 +98,17 @@ def _build_config(config: dict) -> AgentConfig:
         enabled=bool(config.get("enabled", True)),
         debug=bool(config.get("debug", False)),
         llm_timeout=float(config.get("llm_timeout", 30.0)),
+        turn_timeout=_finite_float(config.get("turn_timeout"), 60.0),
+        llm_provider_attempt_timeout=_finite_float(config.get("llm_provider_attempt_timeout"), 15.0),
+        llm_fallback_reserve_seconds=_finite_float(config.get("llm_fallback_reserve_seconds"), 5.0),
         perception_enabled=bool(config.get("perception_enabled", True)),
         planner_enabled=bool(config.get("planner_enabled", True)),
         memory_enabled=bool(config.get("memory_enabled", True)),
         memory_metadata_enabled=bool(config.get("memory_metadata_enabled", True)),
+        memory_fact_extraction_enabled=bool(config.get("memory_fact_extraction_enabled", True)),
+        memory_retention_days=config.get("memory_retention_days", 0.0),
+        memory_journal_retention_days=config.get("memory_journal_retention_days", 0.0),
+        memory_inactive_fact_retention_days=config.get("memory_inactive_fact_retention_days", 0.0),
         memory_backend=str(config.get("memory_backend", "local_sqlite")),
         history_limit=int(config.get("history_limit", 8)),
         session_persistence_enabled=bool(
@@ -215,6 +185,8 @@ def _build_config(config: dict) -> AgentConfig:
         jev_timeout_ms=int(config.get("jev_timeout_ms", 2500)),
         jev_auto_threshold=float(config.get("jev_auto_threshold", 0.85)),
         jev_review_threshold=float(config.get("jev_review_threshold", 0.80)),
+        jev_task_policies=_parse_persona_profile(config.get("jev_task_policies", {})),
+        jev_affect_intervention_enabled=bool(config.get("jev_affect_intervention_enabled", False)),
         jev_perception_enabled=bool(config.get("jev_perception_enabled", True)),
         jev_memory_enabled=bool(config.get("jev_memory_enabled", True)),
         jev_planner_enabled=bool(config.get("jev_planner_enabled", True)),
@@ -282,10 +254,12 @@ def _build_media_config(config: dict) -> MediaConfig:
         tts_max_chars=int(configured_value("media_tts_max_chars", "tts_max_chars", 80)),
         emoji_delay_seconds=float(config.get("media_emoji_delay", 0.5)),
         log_tts_inputs=bool(config.get("media_log_tts_inputs", False)),
+        text_first=bool(config.get("media_text_first", True)),
+        render_timeout_seconds=_finite_float(config.get("media_render_timeout_seconds"), 12.0),
     )
 
 
-class AliceAgentPlugin(Star):
+class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
     """Thin AstrBot entry point for the framework-independent Alice core."""
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
@@ -305,7 +279,10 @@ class AliceAgentPlugin(Star):
             )
             if self._vad_enabled else None
         )
-        llm_service = LLMService(AstrBotLLMAdapter(context), self._config.llm_timeout)
+        llm_service = LLMService(AstrBotLLMAdapter(
+            context, attempt_timeout=self._config.llm_provider_attempt_timeout,
+            fallback_reserve=self._config.llm_fallback_reserve_seconds,
+        ), self._config.llm_timeout)
         context_builder = ContextBuilder(
             profile=self._config.persona_profile,
             novel_config=NovelContextConfig(
@@ -323,14 +300,18 @@ class AliceAgentPlugin(Star):
             if self._config.jev_enabled else DecisionMode.OFF
         )
         decision_port = None
-        if decision_mode != DecisionMode.OFF and self._config.jev_api_key:
+        any_decision_enabled = self._config.jev_enabled and (
+            decision_mode != DecisionMode.OFF
+            or any(policy.get("mode", "off") != "off" for policy in self._config.jev_task_policies.values())
+        )
+        if any_decision_enabled and self._config.jev_api_key:
             decision_port = TypesafeJevAdapter(
                 endpoint=self._config.jev_endpoint,
                 api_key=self._config.jev_api_key,
                 model=self._config.jev_model,
                 timeout_ms=self._config.jev_timeout_ms,
             )
-        elif decision_mode != DecisionMode.OFF:
+        elif any_decision_enabled:
             self.logger.warning(
                 "Jev is enabled but no API key is configured; existing decision paths remain active"
             )
@@ -353,12 +334,14 @@ class AliceAgentPlugin(Star):
             ),
             logger=self.logger,
             metrics_storage=metrics_storage,
+            task_policies=self._config.jev_task_policies if self._config.jev_enabled else {},
         )
         self._test_logger = AtomicJSONTurnLogger(data_dir / "test_turns")
+        self._proactive_audit = DailyProactiveLogger(data_dir / "proactive_today.log", self.logger)
         self._send_coordinator = SessionSendCoordinator()
         self._pending_replies = PendingReplyCoordinator()
         self._timing_service = ResponseTimingService(
-            decision_service, enabled=self._config.response_timing_enabled
+            decision_service.for_task("response_timing"), enabled=self._config.response_timing_enabled
         )
         self._media_renderer = AstrBotMediaRenderer(
             self._media_config,
@@ -376,7 +359,7 @@ class AliceAgentPlugin(Star):
             )
             media_selector = DecisionAwareMediaSelector(
                 media_catalog,
-                decision_service,
+                decision_service.for_task("media"),
                 self._media_config,
                 default_reference_available=bool(
                     self._media_config.default_ref_audio
@@ -416,6 +399,7 @@ class AliceAgentPlugin(Star):
                 memory_port,
                 self._config.memory_importance_threshold,
                 importance_evaluator,
+                fact_extraction_enabled=self._config.memory_fact_extraction_enabled,
             ),
             MemoryReranker(MemoryRerankConfig(
                 min_relevance=self._config.memory_min_relevance,
@@ -435,7 +419,7 @@ class AliceAgentPlugin(Star):
             logger=self.logger,
             debug=self._config.debug,
             decision_gate=MemoryDecisionGate(
-                decision_service,
+                decision_service.for_task("memory"),
                 enabled=self._config.jev_memory_enabled,
                 min_relevance=self._config.memory_min_relevance,
             ),
@@ -459,7 +443,7 @@ class AliceAgentPlugin(Star):
         state_manager = StateManager(state_storage, StateReducer(), TimeStateReducer())
         daily_events = DailyEventService(
             state_storage, state_manager, llm_service, context_builder,
-            decision_service,
+            decision_service.for_task("daily_event"),
             enabled=self._config.daily_events_enabled,
             max_events=self._config.daily_event_max,
             llm_enabled=self._config.daily_event_llm_enabled,
@@ -486,6 +470,35 @@ class AliceAgentPlugin(Star):
             max_age_seconds=self._config.history_restore_max_age_hours * 3600.0,
         )
         self._session_manager = session_manager
+        from .alice_agent.memory.data_service import MemoryDataService
+
+        async def invalidate_context(job):
+            user_id = job["user_id"]
+            sessions = set(job["session_ids"])
+            if job.get("scope_session") is None:
+                sessions.update(await autonomy_store.sessions_for_user(user_id))
+            for session_id in sessions:
+                await session_manager.forget(session_id)
+                await state_manager.clear_context(session_id)
+                await state_storage.delete_prefix("alice_daily_events_v1", session_id + "\0")
+            await autonomy_store.invalidate_data_context(user_id, sorted(sessions))
+            await asyncio.to_thread(self._test_logger.delete_user, user_id, job.get("scope_session"))
+            await asyncio.to_thread(self._proactive_audit.delete_user,
+                                    "" if job.get("scope_session") else user_id, sessions)
+
+        async def maintain_logs(now):
+            await session_manager.maintenance()
+            days = min(3650, max(0, int(_finite_float(raw_config.get("test_log_retention_days", 0), 0.0))))
+            if days:
+                await asyncio.to_thread(self._test_logger.cleanup_expired, days, now=now)
+
+        self._data_service = MemoryDataService(
+            memory_port, metadata_store, invalidate_context=invalidate_context, logger=self.logger,
+            journal_days=self._config.memory_journal_retention_days,
+            memory_days=self._config.memory_retention_days,
+            inactive_fact_days=self._config.memory_inactive_fact_retention_days,
+            maintenance_extra=maintain_logs,
+        )
         response_generator = ResponseGenerator(llm_service, context_builder)
         existing_perception = PerceptionService(
             llm_service,
@@ -500,11 +513,14 @@ class AliceAgentPlugin(Star):
             enabled=self._config.planner_enabled,
         )
         pipeline = AgentPipeline(
+            delivery_journal=self._build_delivery_journal(data_dir),
+            data_service=self._data_service,
             config=self._config,
             perception=DecisionAwarePerceptionService(
                 existing_perception,
-                decision_service,
+                decision_service.for_task("perception"),
                 enabled=self._config.jev_perception_enabled,
+                affect_intervention_enabled=self._config.jev_affect_intervention_enabled,
                 vad_model=self._vad_model,
                 vad_enabled=self._vad_enabled,
                 jev_weight=float(raw_config.get("jev_vad_weight", 0.5)),
@@ -513,7 +529,7 @@ class AliceAgentPlugin(Star):
             memory=memory,
             planner=DecisionAwarePlannerService(
                 existing_planner,
-                decision_service,
+                decision_service.for_task("planner"),
                 enabled=self._config.jev_planner_enabled,
             ),
             response_generator=response_generator,
@@ -524,6 +540,7 @@ class AliceAgentPlugin(Star):
             daily_events=daily_events,
         )
         self._agent = AliceAgent(pipeline, llm_service, decision_service)
+        self._data_service.delivery_recovery = pipeline.recover_deliveries
         self._decision_service = decision_service
         self._message_adapter = AstrBotMessageAdapter()
         if self._config.memory_backend.strip().lower() == "in_memory":
@@ -548,6 +565,9 @@ class AliceAgentPlugin(Star):
             )),
         )
         self._agent_loop = AgentLoop(
+            audit=self._proactive_audit,
+            delivery_coordinator=pipeline._delivery,
+            data_service=self._data_service,
             config=self._config,
             event_bus=EventBus(),
             clock=SystemClock(),
@@ -591,6 +611,7 @@ class AliceAgentPlugin(Star):
             sender=AstrBotProactiveSender(
                 context,
                 self.logger,
+                audit=self._proactive_audit,
                 split_enabled=bool(raw_config.get("segmented_send_enabled", True)),
                 split_max_chars=_positive_int(
                     raw_config.get("segmented_send_max_chars", 120), 120
@@ -603,7 +624,7 @@ class AliceAgentPlugin(Star):
             session_manager=session_manager,
             logger=self.logger,
             decision_gate=ProactiveDecisionGate(
-                decision_service, enabled=self._config.jev_proactive_enabled
+                decision_service.for_task("proactive"), enabled=self._config.jev_proactive_enabled
             ),
         )
         self._media_tasks: set[asyncio.Task] = set()
@@ -617,712 +638,55 @@ class AliceAgentPlugin(Star):
         self._closing = False
         self._media_initialized = False
 
+    def _build_delivery_journal(self, data_dir):
+        from .adapters.storage.delivery_journal import SQLiteDeliveryJournal
+        path = Path(":memory:") if self._config.memory_backend.strip().lower() == "in_memory" else data_dir / "alice_operations.db"
+        return SQLiteDeliveryJournal(path)
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @filter.command("alice-status")
+    async def alice_status(self, event: AstrMessageEvent):
+        from .alice_agent.proactive.diagnostics import format_status
+        mapped = self._message_adapter.to_agent_event(event)
+        status = await self._agent_loop.inspect_session(mapped.session_id, mapped.user_id)
+        yield event.plain_result(format_status(status))
+        event.stop_event()
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    @filter.command("alice-data")
+    async def alice_data(self, event: AstrMessageEvent):
+        from .alice_agent.memory.governance import MemoryScope
+        mapped = self._message_adapter.to_agent_event(event)
+        raw = str(getattr(getattr(event, "message_obj", None), "message_str", None) or getattr(event, "message_str", ""))
+        parts = raw.strip().split(maxsplit=1)
+        arguments = parts[1] if len(parts) > 1 else "help"
+        reply = await self._data_service.command(MemoryScope(mapped.user_id, mapped.session_id), arguments, trace_id=mapped.trace_id)
+        from .adapters.astrbot.text_segments import split_bounded_text
+        for part in split_bounded_text(reply, 1000):
+            yield event.plain_result(part)
+        event.stop_event()
+
     async def initialize(self) -> None:
+        await self._proactive_audit.start(lambda: {
+            "enabled": self._config.enabled, "loop_enabled": self._config.agent_loop_enabled,
+            "loop_running": self._agent_loop.running, "proactive_enabled": self._config.proactive_enabled,
+            "daily_events_enabled": self._config.daily_events_enabled, "event_limit": self._config.daily_event_max,
+            "send_window": [self._config.proactive_window_start, self._config.proactive_window_end],
+            "tick_interval_seconds": self._config.agent_tick_interval,
+            "active_window_seconds": self._config.active_conversation_window,
+            "daily_budget": self._config.proactive_daily_budget,
+            "min_interval_seconds": self._config.proactive_min_interval,
+            "score_threshold": self._config.proactive_score_threshold,
+            "daily_score_threshold": self._config.proactive_daily_score_threshold,
+            "daily_attempt_limit": self._config.proactive_daily_attempt_limit,
+        })
+        await self._data_service.start()
         await self._decision_service.start()
         if not self._media_initialized:
             await self._media_renderer.initialize()
             self._media_initialized = True
         await self._agent_loop.start()
 
-    def _segment_settings(self) -> tuple[bool, int, float]:
-        return (
-            bool(self._raw_config.get("segmented_send_enabled", True)),
-            _positive_int(self._raw_config.get("segmented_send_max_chars", 120), 120),
-            max(0.0, _finite_float(
-                self._raw_config.get("segmented_send_interval_seconds", 1.0), 1.0
-            )),
-        )
-
-    async def _record_test_turn(
-        self,
-        agent_event,
-        response: AgentResponse,
-        delivery: dict[str, object],
-    ) -> None:
-        # Read the live config object at write time so turning this switch off
-        # immediately stops the next completed turn from being persisted.
-        if (
-            not self._test_logging_active
-            or not bool(self._raw_config.get("test_log_enabled", False))
-        ):
-            return
-        diagnostics = response.metadata.get("turn_diagnostics", {})
-        record = {
-            "schema_version": "alice_turn_test_v1",
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-            "trace_id": agent_event.trace_id,
-            "session_id": agent_event.session_id,
-            "user_id": agent_event.user_id,
-            "source": agent_event.source,
-            "event_type": agent_event.event_type or agent_event.type,
-            "event_timestamp": agent_event.timestamp,
-            "recent_conversation": (
-                diagnostics.get("history_before_turn", [])
-                if isinstance(diagnostics, dict) else []
-            ),
-            "user_text": agent_event.text or "",
-            "user_messages": list(
-                agent_event.payload.get("user_messages", [])
-                if isinstance(agent_event.payload, dict) else []
-            ),
-            "response_timing": (
-                agent_event.metadata.get("response_timing")
-                if isinstance(agent_event.metadata, dict) else None
-            ),
-            # Store what was actually yielded to AstrBot separately from the
-            # full generated answer. A partial failure must not look like a
-            # complete reply in the dialogue log.
-            "assistant_text": "".join(
-                str(part) for part in delivery.get("yielded_text_segments", [])
-            ),
-            "generated_assistant_text": response.text,
-            "yielded_text_segments": list(
-                delivery.get("yielded_text_segments", [])
-            ),
-            "action": response.action,
-            "fallback": bool(
-                response.metadata.get("fallback")
-                or delivery.get("fallback_yielded")
-            ),
-            "diagnostics": diagnostics,
-            "decision_comparison": (
-                diagnostics.get("decision_comparison")
-                if isinstance(diagnostics, dict) else None
-            ),
-            "delivery": delivery,
-        }
-        try:
-            await asyncio.to_thread(
-                self._test_logger.write,
-                record,
-                enabled=lambda: self._test_logging_active
-                and bool(self._raw_config.get("test_log_enabled", False)),
-                retention_days=min(3650, max(0, int(_finite_float(
-                    self._raw_config.get("test_log_retention_days", 0), 0.0
-                )))),
-            )
-        except Exception:
-            self.logger.exception(
-                f"[{agent_event.trace_id}] Alice test-turn JSON write failed safely"
-            )
-
-    async def _send_emoji_delayed(
-        self, event: AstrMessageEvent, path: str, is_current=None
-    ) -> bool:
-        try:
-            await asyncio.sleep(self._media_config.emoji_delay_seconds)
-            if is_current is not None and not is_current():
-                return False
-            result = await event.send(
-                event.chain_result([Comp.Image.fromFileSystem(path=path)])
-            )
-            if result is False:
-                self.logger.warning("Alice media: delayed emoji send was rejected")
-                return False
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger.exception("Alice media: delayed emoji send failed safely")
-            return False
-
-    def _begin_input_registration(self, session_id: str, event_id: str) -> bool:
-        key = (session_id, event_id)
-        if key in self._recent_event_ids:
-            return False
-        self._recent_event_ids[key] = None
-        while len(self._recent_event_ids) > 4096:
-            self._recent_event_ids.popitem(last=False)
-        if self._registration_pending[session_id] == 0:
-            self._registrations_ready[session_id].clear()
-        self._registration_pending[session_id] += 1
-        # This synchronous epoch bump is deliberately before every await: it
-        # invalidates any old generation before database or Jev latency.
-        self._reactive_epoch[session_id] += 1
-        return True
-
-    def _finish_input_registration(self, session_id: str) -> None:
-        self._registration_pending[session_id] = max(
-            0, self._registration_pending[session_id] - 1
-        )
-        if self._registration_pending[session_id] == 0:
-            self._registrations_ready[session_id].set()
-
-    async def _prepare_pending_message(
-        self, framework_event: AstrMessageEvent
-    ) -> tuple[PendingReplyBatch, PendingMessage, bool] | None:
-        agent_event = self._message_adapter.to_agent_event(framework_event)
-        session_id = agent_event.session_id
-        if not self._begin_input_registration(session_id, agent_event.event_id):
-            framework_event.stop_event()
-            return None
-        item: PendingMessage | None = None
-        try:
-            revision = await self._agent_loop.register_user_event(agent_event)
-            if revision is None:
-                framework_event.stop_event()
-                return None
-            item = PendingMessage(
-                agent_event=agent_event,
-                framework_event=framework_event,
-                merge_safe=bool(agent_event.metadata.get("merge_safe", False)),
-                revision=revision,
-            )
-            batch, is_owner = await self._pending_replies.submit(
-                item,
-                boundary=ResponseTimingService.has_batch_boundary(agent_event.text or ""),
-                cancel_current=ResponseTimingService.is_no_reply_command(agent_event.text or ""),
-            )
-        finally:
-            self._finish_input_registration(session_id)
-        try:
-            await self._agent_loop.apply_user_activity(agent_event)
-        except Exception:
-            self.logger.exception(
-                f"[{agent_event.trace_id}] Alice user activity update failed safely"
-            )
-        classifier = asyncio.create_task(self._classify_pending_item(batch, item))
-        item.classification_task = classifier
-        self._classification_tasks.add(classifier)
-        classifier.add_done_callback(self._classification_tasks.discard)
-        return batch, item, is_owner
-
-    async def _classify_pending_item(
-        self, batch: PendingReplyBatch, item: PendingMessage
-    ) -> None:
-        try:
-            async with self._timing_locks[batch.session_id]:
-                if item.timing is not None or batch.phase == "cancelled":
-                    return
-                messages = [candidate.agent_event.text or "" for candidate in batch.items]
-                history = await self._session_manager.load_history(batch.session_id)
-                decision = await self._timing_service.decide(
-                    item.agent_event,
-                    history=history,
-                    current_messages=messages,
-                )
-                if item.timing is None:
-                    item.timing = decision
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.logger.warning(
-                f"[{item.agent_event.trace_id}] response timing failed; using local fallback ({type(exc).__name__})"
-            )
-            if item.timing is None:
-                item.timing = self._timing_service.local_fallback(item.agent_event)
-        finally:
-            if item.timing is None and batch.phase != "cancelled":
-                item.timing = self._timing_service.local_fallback(item.agent_event)
-            item.timing_ready.set()
-
-    async def _await_pending_registrations(self, session_id: str) -> None:
-        if self._registration_pending[session_id] > 0:
-            await self._registrations_ready[session_id].wait()
-
-    async def _resolve_batch_timing(
-        self, batch: PendingReplyBatch
-    ) -> tuple[str, bool, float]:
-        hard_deadline = batch.created_at + self._config.response_wait_max_seconds
-        while not self._closing:
-            remaining = hard_deadline - time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    batch.wait_for_classification(), timeout=max(0.001, remaining)
-                )
-            except asyncio.TimeoutError:
-                # Jev latency cannot extend the first-message hard deadline.
-                # Freeze unfinished classifications to their deterministic
-                # local rules and cancel their late model requests.
-                for item in batch.items:
-                    if item.timing is None:
-                        item.timing = self._timing_service.local_fallback(
-                            item.agent_event, status="hard_deadline_fallback"
-                        )
-                        item.timing_ready.set()
-                        if item.classification_task is not None:
-                            item.classification_task.cancel()
-                frozen_action = batch.action()
-                if frozen_action == "ignore":
-                    return "ignore", True, max(0.0, time.monotonic() - batch.created_at)
-                return "reply_now", True, max(0.0, time.monotonic() - batch.created_at)
-            if batch.phase == "cancelled" or self._closing:
-                return "cancelled", False, max(0.0, time.monotonic() - batch.created_at)
-
-            action = batch.action()
-            if action in {"ignore", "reply_now"}:
-                return action, False, max(0.0, time.monotonic() - batch.created_at)
-            if any(not item.merge_safe for item in batch.items):
-                return "reply_now", False, max(0.0, time.monotonic() - batch.created_at)
-            now = time.monotonic()
-            if now >= hard_deadline:
-                return "reply_now", True, max(0.0, now - batch.created_at)
-            quiet_deadline = batch.last_input_at + self._config.response_wait_quiet_seconds
-            target = min(quiet_deadline, hard_deadline)
-            if now >= target:
-                return "reply_now", target == hard_deadline, max(0.0, now - batch.created_at)
-            batch.changed.clear()
-            try:
-                await asyncio.wait_for(batch.changed.wait(), timeout=target - now)
-            except asyncio.TimeoutError:
-                continue
-        return "cancelled", False, max(0.0, time.monotonic() - batch.created_at)
-
-    @staticmethod
-    def _batch_timing_diagnostics(
-        batch: PendingReplyBatch, actual_wait_seconds: float
-    ) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
-        for item in batch.items:
-            timing = item.timing
-            if timing is None:
-                diagnostic: dict[str, object] = {"status": "pending"}
-            else:
-                diagnostic = dict(timing.diagnostic)
-                diagnostic.update({
-                    "selected_action": timing.action,
-                    "selected_source": timing.source,
-                    "confidence": timing.confidence,
-                })
-            diagnostic["event_id"] = item.agent_event.event_id
-            diagnostic["actual_wait_seconds"] = round(actual_wait_seconds, 3)
-            result.append(diagnostic)
-        return result
-
-    def _make_batch_event(
-        self,
-        batch: PendingReplyBatch,
-        *,
-        actual_wait_seconds: float,
-        hard_deadline_reached: bool,
-    ) -> AgentEvent:
-        items = list(batch.items)
-        first = items[0].agent_event
-        last = items[-1].agent_event
-        texts = [item.agent_event.text or "" for item in items]
-        joined_text = "\n".join(texts)
-        messages = [
-            {
-                "event_id": item.agent_event.event_id,
-                "timestamp": item.agent_event.timestamp,
-                "text": item.agent_event.text or "",
-            }
-            for item in items
-        ]
-        timing_diagnostics = self._batch_timing_diagnostics(batch, actual_wait_seconds)
-        metadata = dict(first.metadata)
-        metadata.update({
-            "merge_safe": all(item.merge_safe for item in items),
-            "timing_force_reply": True,
-            "response_timing": {
-                "decisions": timing_diagnostics,
-                "actual_wait_seconds": round(actual_wait_seconds, 3),
-                "hard_deadline_reached": hard_deadline_reached,
-                "message_count": len(items),
-            },
-        })
-        payload = dict(first.payload)
-        payload["text"] = joined_text
-        payload["user_messages"] = messages
-        return AgentEvent(
-            event_id=first.event_id,
-            trace_id=first.trace_id,
-            type=first.type,
-            source=first.source,
-            session_id=first.session_id,
-            user_id=first.user_id,
-            timestamp=last.timestamp,
-            text=joined_text,
-            metadata=metadata,
-            event_type=first.event_type,
-            payload=payload,
-        )
-
-    def _is_batch_current(
-        self, batch: PendingReplyBatch, version: int, epoch: int
-    ) -> bool:
-        return (
-            not self._closing
-            and batch.phase != "cancelled"
-            and batch.version == version
-            and self._reactive_epoch[batch.session_id] == epoch
-        )
-
-    async def _handle_without_timing(self, framework_event: AstrMessageEvent):
-        """Compatibility path: no merge window, Jev timing, or stale-send cutoff."""
-        task = asyncio.current_task()
-        if task is not None:
-            self._reactive_tasks.add(task)
-        try:
-            agent_event = self._message_adapter.to_agent_event(framework_event)
-            if not await self._agent_loop.on_user_event(agent_event):
-                framework_event.stop_event()
-                return
-            item = PendingMessage(
-                agent_event=agent_event,
-                framework_event=framework_event,
-                merge_safe=False,
-                revision=0,
-                timing=ReplyTimingDecision(
-                    "reply_now", "disabled", 1.0,
-                    {"status": "timing_disabled", "selected_action": "reply_now"},
-                ),
-            )
-            item.timing_ready.set()
-            batch = PendingReplyBatch(
-                session_id=agent_event.session_id,
-                items=[item],
-                phase="processing",
-                max_messages=1,
-            )
-            version = batch.version
-            epoch = self._reactive_epoch[agent_event.session_id]
-            async with self._send_coordinator.lock_for(agent_event.session_id):
-                async def always_current() -> bool:
-                    return not self._closing
-
-                response = await self._agent.handle_event(
-                    agent_event, is_current=always_current
-                )
-                if not response.text:
-                    delivery: dict[str, object] = {
-                        "status": "no_text",
-                        "segments_yielded": 0,
-                        "yielded_text_segments": [],
-                        "audio_yielded": False,
-                        "emoji_send_completed": False,
-                        "delivery_confirmation": "platform_acceptance_unknown",
-                    }
-                    await self._agent.commit_delivery(agent_event, response, "")
-                    await self._record_test_turn(agent_event, response, delivery)
-                    framework_event.stop_event()
-                    return
-                delivery: dict[str, object] = {
-                    "status": "not_sent",
-                    "segments_yielded": 0,
-                    "yielded_text_segments": [],
-                    "audio_yielded": False,
-                    "emoji_send_completed": False,
-                    "delivery_confirmation": "platform_acceptance_unknown",
-                }
-                outcome = {"stale_before_output": False, "stopped_for_new_input": False}
-                async for result in self._deliver_response_locked(
-                    framework_event, agent_event, response, batch,
-                    version, epoch, delivery, outcome,
-                ):
-                    yield result
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger.exception("Alice Agent adapter failed while processing a private message")
-            yield framework_event.plain_result(self._config.fallback_text)
-            framework_event.stop_event()
-        finally:
-            if task is not None:
-                self._reactive_tasks.discard(task)
-
-    async def _deliver_response_locked(
-        self,
-        framework_event: AstrMessageEvent,
-        agent_event: AgentEvent,
-        response: AgentResponse,
-        batch: PendingReplyBatch,
-        version: int,
-        epoch: int,
-        delivery: dict[str, object],
-        outcome: dict[str, bool],
-    ):
-        """Yield platform results and commit only the content handed to AstrBot."""
-        session_id = agent_event.session_id
-        is_current = lambda: self._is_batch_current(batch, version, epoch)
-        audio_delivered = False
-        finalized = False
-
-        async def finalize() -> None:
-            nonlocal finalized
-            if finalized or outcome.get("stale_before_output"):
-                return
-            finalized = True
-            text_segments = delivery.get("yielded_text_segments", [])
-            delivered_text = "".join(str(part) for part in text_segments) if isinstance(text_segments, list) else ""
-            if audio_delivered:
-                # A rendered voice file represents the complete generated text.
-                delivered_text = response.text or delivered_text
-            if delivered_text or audio_delivered:
-                await self._agent.commit_delivery(agent_event, response, delivered_text)
-            else:
-                await self._agent.record_suppressed(
-                    agent_event,
-                    agent_event.metadata.get("response_timing", {}),
-                )
-            await self._record_test_turn(agent_event, response, delivery)
-            framework_event.stop_event()
-
-        try:
-            if not is_current():
-                outcome["stale_before_output"] = True
-                return
-            if not response.text:
-                fallback_text = self._config.fallback_text
-                batch.phase = "delivering"
-                delivery.update({"status": "handed_to_framework", "fallback_yielded": True})
-                text_segments = delivery["yielded_text_segments"]
-                if isinstance(text_segments, list):
-                    text_segments.append(fallback_text)
-                delivery["segments_yielded"] = 1
-                yield framework_event.plain_result(fallback_text)
-                await finalize()
-                return
-
-            rendered = await self._media_renderer.render(
-                session_id,
-                response.text,
-                response.metadata.get("media_decision"),
-            )
-            if not is_current():
-                outcome["stale_before_output"] = True
-                return
-            diagnostics = response.metadata.get("turn_diagnostics")
-            if isinstance(diagnostics, dict):
-                diagnostics["media_render"] = {
-                    "media_enabled": self._media_config.enabled,
-                    "voice_runtime_available": bool(getattr(self._media_renderer, "voice_runtime_available", False)),
-                    "voice_requested": bool(getattr(response.metadata.get("media_decision"), "send_voice", False)),
-                    "audio_available": bool(rendered.audio_path),
-                    "emoji_available": bool(rendered.emoji_path),
-                    "text_with_audio": self._media_config.send_text_with_audio,
-                }
-
-            split_enabled, max_chars, interval = self._segment_settings()
-            text_segments = split_text(response.text, max_chars) if split_enabled else [response.text]
-            text_is_sent = not rendered.audio_path or self._media_config.send_text_with_audio
-            qq_voice_standalone = bool(
-                rendered.audio_path
-                and agent_event.source in {"qq_official", "qq_official_webhook"}
-            )
-            qq_message_kind = type(
-                getattr(getattr(framework_event, "message_obj", None), "raw_message", None)
-            ).__name__
-            delivery["audio_route"] = (
-                "standalone_qq_official" if qq_voice_standalone
-                else "combined_with_text" if rendered.audio_path and text_is_sent
-                else "standalone" if rendered.audio_path else "none"
-            )
-            qq_guild_voice_unsupported = bool(
-                qq_voice_standalone and qq_message_kind in {"Message", "DirectMessage"}
-            )
-            if qq_guild_voice_unsupported:
-                delivery["audio_route"] = "qq_official_guild_adapter_unsupported"
-                self.logger.warning(
-                    "Alice media: installed QQ official guild adapter has no voice upload path"
-                )
-                # Do not mark an unsupported QQ guild-DM Record as delivered.
-                # Fall back to plain text even when text_with_audio is disabled.
-                qq_voice_standalone = False
-                text_is_sent = True
-                render_audio_path = None
-            else:
-                render_audio_path = rendered.audio_path
-
-            batch.phase = "delivering"
-            if qq_voice_standalone and render_audio_path:
-                if not is_current():
-                    outcome["stopped_for_new_input"] = True
-                else:
-                    audio_delivered = True
-                    delivery["audio_yielded"] = True
-                    delivery["segments_yielded"] = int(delivery["segments_yielded"]) + 1
-                    yield framework_event.chain_result([Comp.Record(file=render_audio_path)])
-            if not outcome.get("stopped_for_new_input") and render_audio_path and not text_is_sent:
-                if not qq_voice_standalone:
-                    if is_current():
-                        audio_delivered = True
-                        delivery["audio_yielded"] = True
-                        delivery["segments_yielded"] = int(delivery["segments_yielded"]) + 1
-                        yield framework_event.chain_result([Comp.Record(file=render_audio_path)])
-                    else:
-                        outcome["stopped_for_new_input"] = True
-            elif not outcome.get("stopped_for_new_input"):
-                for index, segment in enumerate(text_segments):
-                    if not is_current():
-                        outcome["stopped_for_new_input"] = True
-                        break
-                    if index == 0 and render_audio_path and not qq_voice_standalone:
-                        result = framework_event.chain_result([
-                            Comp.Record(file=render_audio_path), Comp.Plain(segment)
-                        ])
-                        audio_delivered = True
-                        delivery["audio_yielded"] = True
-                    else:
-                        result = framework_event.plain_result(segment)
-                    text_out = delivery["yielded_text_segments"]
-                    if isinstance(text_out, list):
-                        text_out.append(segment)
-                    delivery["segments_yielded"] = int(delivery["segments_yielded"]) + 1
-                    yield result
-                    if interval > 0 and index + 1 < len(text_segments):
-                        await asyncio.sleep(interval)
-
-            if rendered.emoji_path and is_current():
-                delivery["emoji_send_completed"] = await self._send_emoji_delayed(
-                    framework_event, rendered.emoji_path, is_current
-                )
-            delivery["status"] = (
-                "partial_after_new_input" if outcome.get("stopped_for_new_input")
-                else "handed_to_framework"
-            )
-            delivery["text_segments_planned"] = len(text_segments) if text_is_sent else 0
-            delivery["text_segments_yielded"] = len(delivery["yielded_text_segments"])
-            delivery["segmented"] = bool(split_enabled and len(text_segments) > 1)
-            if outcome.get("stopped_for_new_input"):
-                outcome["stopped_after_output"] = True
-            await finalize()
-        except asyncio.CancelledError:
-            if delivery.get("segments_yielded"):
-                delivery["status"] = "cancelled_after_partial_output"
-                await finalize()
-            elif not outcome.get("stale_before_output"):
-                delivery["status"] = "cancelled_before_output"
-                await finalize()
-            raise
-        except Exception as exc:
-            self.logger.exception("Alice Agent adapter failed while delivering a private reply")
-            delivery["error_kind"] = type(exc).__name__
-            if not delivery.get("segments_yielded") and is_current():
-                fallback_text = self._config.fallback_text
-                batch.phase = "delivering"
-                text_out = delivery["yielded_text_segments"]
-                if isinstance(text_out, list):
-                    text_out.append(fallback_text)
-                delivery["segments_yielded"] = 1
-                delivery["fallback_yielded"] = True
-                delivery["status"] = "fallback_handed_to_framework"
-                yield framework_event.plain_result(fallback_text)
-            elif delivery.get("segments_yielded"):
-                delivery["status"] = "partial_failure"
-            await finalize()
-
-    async def _run_pending_batch(self, batch: PendingReplyBatch):
-        owner_event = batch.items[0].framework_event
-        session_id = batch.session_id
-        try:
-            while not self._closing:
-                action, hard_deadline_reached, actual_wait = await self._resolve_batch_timing(batch)
-                if action == "cancelled" or self._closing:
-                    return
-                snapshot_version = batch.version
-                snapshot_epoch = self._reactive_epoch[session_id]
-                agent_event = self._make_batch_event(
-                    batch,
-                    actual_wait_seconds=actual_wait,
-                    hard_deadline_reached=hard_deadline_reached,
-                )
-                if not await self._pending_replies.wait_turn(batch):
-                    return
-                if not self._is_batch_current(batch, snapshot_version, snapshot_epoch):
-                    continue
-
-                delivery: dict[str, object] = {
-                    "status": "not_sent",
-                    "segments_yielded": 0,
-                    "yielded_text_segments": [],
-                    "audio_yielded": False,
-                    "emoji_send_completed": False,
-                    "delivery_confirmation": "platform_acceptance_unknown",
-                    "timing_wait_seconds": round(actual_wait, 3),
-                }
-                outcome = {"stale_before_output": False, "stopped_for_new_input": False}
-                if not self._is_batch_current(batch, snapshot_version, snapshot_epoch):
-                    continue
-                if action == "ignore":
-                    batch.phase = "delivering"
-                    response = AgentResponse(
-                        text=None,
-                        trace_id=agent_event.trace_id,
-                        action="ignore",
-                        metadata={
-                            "turn_diagnostics": {
-                                "response_timing": agent_event.metadata.get("response_timing", {})
-                            }
-                        },
-                    )
-                    delivery["status"] = "ignored_by_timing"
-                    await self._agent.record_suppressed(
-                        agent_event,
-                        agent_event.metadata.get("response_timing", {}),
-                    )
-                    await self._record_test_turn(agent_event, response, delivery)
-                    owner_event.stop_event()
-                    return
-
-                # Generation is intentionally outside the shared send lock:
-                # intake can invalidate this revision immediately, and
-                # proactive sends are not held behind a potentially slow LLM.
-                batch.phase = "processing"
-
-                async def guard() -> bool:
-                    return self._is_batch_current(batch, snapshot_version, snapshot_epoch)
-
-                try:
-                    response = await self._agent.handle_event(
-                        agent_event, is_current=guard
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self.logger.exception("Alice Agent pipeline failed while handling a private message")
-                    response = AgentResponse(
-                        text=self._config.fallback_text,
-                        trace_id=agent_event.trace_id,
-                        metadata={
-                            "fallback": True,
-                            "turn_diagnostics": {
-                                "pipeline_failure": {"error_kind": type(exc).__name__}
-                            },
-                        },
-                    )
-                if response.action == "superseded" or not self._is_batch_current(
-                    batch, snapshot_version, snapshot_epoch
-                ):
-                    outcome["stale_before_output"] = True
-                else:
-                    async with self._send_coordinator.lock_for(session_id):
-                        if not self._is_batch_current(batch, snapshot_version, snapshot_epoch):
-                            outcome["stale_before_output"] = True
-                        else:
-                            async for result in self._deliver_response_locked(
-                                owner_event,
-                                agent_event,
-                                response,
-                                batch,
-                                snapshot_version,
-                                snapshot_epoch,
-                                delivery,
-                                outcome,
-                            ):
-                                yield result
-
-                if outcome["stale_before_output"]:
-                    await self._await_pending_registrations(session_id)
-                    continue
-                owner_event.stop_event()
-                return
-        except asyncio.CancelledError:
-            if batch.phase not in {"done", "cancelled", "delivering"} and not self._closing:
-                try:
-                    event = self._make_batch_event(
-                        batch,
-                        actual_wait_seconds=max(0.0, time.monotonic() - batch.created_at),
-                        hard_deadline_reached=False,
-                    )
-                    await self._agent.record_suppressed(
-                        event, event.metadata.get("response_timing", {})
-                    )
-                except Exception:
-                    self.logger.exception("Alice Agent could not preserve cancelled input safely")
-            raise
-        finally:
-            await self._pending_replies.finish(batch)
 
     # The event-type decorator must run first so its priority is retained by
     # AstrBot's shared handler metadata when the custom filter is attached.
@@ -1332,8 +696,9 @@ class AliceAgentPlugin(Star):
         if not self._config.enabled or self._closing:
             return
         if not self._config.response_timing_enabled:
-            async for result in self._handle_without_timing(event):
-                yield result
+            async with aclosing(self._handle_without_timing(event)) as stream:
+                async for result in stream:
+                    yield result
             return
         task = asyncio.current_task()
         if task is not None:
@@ -1348,8 +713,9 @@ class AliceAgentPlugin(Star):
                 # The current owner will answer the entire merged batch.
                 event.stop_event()
                 return
-            async for result in self._run_pending_batch(batch):
-                yield result
+            async with aclosing(self._run_pending_batch(batch)) as stream:
+                async for result in stream:
+                    yield result
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1371,6 +737,10 @@ class AliceAgentPlugin(Star):
     async def terminate(self) -> None:
         self._closing = True
         self._test_logging_active = False
+        # Stop new autonomous output before waiting on data maintenance/cleanup.
+        # Its stores stay open until the remaining local commits have settled.
+        await self._agent_loop.stop()
+        await self._proactive_audit.close()
         await self._pending_replies.cancel_all()
         current = asyncio.current_task()
         tasks = {
@@ -1388,6 +758,7 @@ class AliceAgentPlugin(Star):
         if self._media_tasks:
             await asyncio.gather(*self._media_tasks, return_exceptions=True)
         self._media_tasks.clear()
+        await self._data_service.close()
         await self._agent_loop.close()
         await self._agent.close()
         await self._media_renderer.close()

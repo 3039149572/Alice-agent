@@ -142,6 +142,7 @@ class MemoryManager:
         plan: ActionPlan,
         response: AgentResponse,
         relationship: RelationshipState | None = None,
+        *, strict: bool = False,
     ) -> bool:
         if not self._enabled:
             return False
@@ -153,21 +154,25 @@ class MemoryManager:
             return False
         accepted = await self._port.observe(observation)
         if accepted and observation.persist_candidate and self._metadata_enabled:
-            item = observation.item
-            try:
-                await self._metadata.save(MemoryMetadata(
-                    memory_id=item.id,
-                    importance=item.importance,
-                    emotional_weight=item.emotional_weight,
-                    relationship_weight=item.relationship_weight,
-                    confidence=item.confidence,
-                    created_at=item.created_at,
-                    updated_at=time.time(),
-                ))
-            except Exception:
-                self._logger.exception(
-                    f"Memory metadata write failed id={item.id}"
-                )
+            for item in observation.persisted_items or [observation.item]:
+                try:
+                    # A repeated fact reuses its existing ID. Preserve explicit
+                    # pinning/access metadata rather than resetting it per turn.
+                    if item.id in await self._metadata.get_many([item.id]):
+                        continue
+                    await self._metadata.save(MemoryMetadata(
+                        memory_id=item.id,
+                        importance=item.importance,
+                        emotional_weight=item.emotional_weight,
+                        relationship_weight=item.relationship_weight,
+                        confidence=item.confidence,
+                        created_at=item.created_at,
+                        updated_at=time.time(),
+                    ))
+                except Exception:
+                    self._logger.exception(f"Memory metadata write failed id={item.id}")
+                    if strict:
+                        raise
         return accepted
 
     def select_for_response(
@@ -178,11 +183,22 @@ class MemoryManager:
             : self._selected_limit
         ]
 
-    async def record_access(self, memories: list[MemoryItem]) -> None:
+    async def load_for_delivery(self, event: AgentEvent, memory_ids: list[str]) -> list[MemoryItem]:
+        result = []
+        for memory_id in dict.fromkeys(memory_ids):
+            item = await self._port.get(memory_id)
+            if item is not None and item.metadata.get("user_id") == event.user_id:
+                result.append(item)
+        return result
+
+    async def record_access(self, memories: list[MemoryItem], *, operation_id: str | None = None) -> None:
         if not memories or not self._metadata_enabled:
             return
         accessed_at = time.time()
-        await self._metadata.record_access([item.id for item in memories], accessed_at)
+        if operation_id is None:
+            await self._metadata.record_access([item.id for item in memories], accessed_at)
+        elif not await self._metadata.record_access_once([item.id for item in memories], accessed_at, operation_id):
+            return
         for item in memories:
             item.access_count += 1
             item.last_accessed_at = accessed_at

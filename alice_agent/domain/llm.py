@@ -9,6 +9,7 @@ class LLMRequest:
     session_id: str
     prompt: str
     system_prompt: str
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

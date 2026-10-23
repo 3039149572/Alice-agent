@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 class StoragePort(Protocol):
+    async def mutate_once(self, namespace: str, key: str, operation_id: str, transform: Callable[[Any], Any]) -> Any: ...
     async def get(self, namespace: str, key: str) -> Any | None: ...
 
     async def set(self, namespace: str, key: str, value: Any) -> None: ...

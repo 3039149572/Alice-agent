@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import uuid
+import hashlib
+import json
 
 from ..domain.action import ActionPlan
 from ..domain.event import AgentEvent
@@ -11,16 +12,19 @@ from ..domain.state import AgentState
 from ..ports.memory import MemoryPort
 from ..relationship.models import RelationshipState
 from .importance import MemoryImportanceEvaluator
+from .facts import extract_explicit_facts
 
 
 class MemoryWriter:
     def __init__(
         self, port: MemoryPort, importance_threshold: float,
         evaluator: MemoryImportanceEvaluator | None = None,
+        *, fact_extraction_enabled: bool = False,
     ) -> None:
         self._port = port
         self._threshold = min(1.0, max(0.0, importance_threshold))
         self._evaluator = evaluator or MemoryImportanceEvaluator()
+        self._facts_enabled = fact_extraction_enabled
 
     def build_observation(
         self,
@@ -34,7 +38,7 @@ class MemoryWriter:
         if not event.text:
             return None
         item = MemoryItem(
-            id=f"mem_{uuid.uuid4().hex}",
+            id="mem_" + hashlib.sha256(json.dumps([event.user_id, event.session_id, event.trace_id]).encode()).hexdigest()[:32],
             content=event.text,
             memory_type="conversation_event",
             source_layer="LOCAL",
@@ -57,11 +61,15 @@ class MemoryWriter:
         item.importance = evaluated.importance
         item.emotional_weight = evaluated.emotional_weight
         item.relationship_weight = evaluated.relationship_weight
+        facts = extract_explicit_facts(event.text) if self._facts_enabled else []
+        if facts:
+            item.metadata["extract_explicit_facts"] = True
+            item.importance = max(item.importance, 0.7)
         return MemoryObservation(
             item=item,
             assistant_text=response.text,
             persist_candidate=(
-                perception.memory_candidate
+                (perception.memory_candidate or bool(facts))
                 and item.importance >= self._threshold
             ),
         )

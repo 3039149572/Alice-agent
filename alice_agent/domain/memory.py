@@ -77,6 +77,7 @@ class MemoryObservation:
     item: MemoryItem
     assistant_text: str | None
     persist_candidate: bool
+    persisted_items: list[MemoryItem] = field(default_factory=list)
 
 
 @dataclass(slots=True)

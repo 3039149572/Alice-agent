@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import re
 import uuid
 import wave
+import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +21,23 @@ from ...alice_agent.media.models import MediaConfig, MediaDecision
 class RenderedMedia:
     audio_path: str | None = None
     emoji_path: str | None = None
+    spoken_source_text: str | None = None
+    timed_out: bool = False
+
+
+_BACKEND_LOCKS = weakref.WeakKeyDictionary()
+
+
+def _backend_lock(base_url: str, character: str) -> asyncio.Lock:
+    """Genie reference state is shared by character, including renderer instances."""
+    loop = asyncio.get_running_loop()
+    locks = _BACKEND_LOCKS.setdefault(loop, weakref.WeakValueDictionary())
+    key = (base_url, character)
+    lock = locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[key] = lock
+    return lock
 
 
 class AstrBotMediaRenderer:
@@ -49,12 +68,12 @@ class AstrBotMediaRenderer:
         self._client = client
         self._current_ref_path: str | None = None
         self._current_ref_text: str | None = None
-        self._last_audio_path: str | None = None
+        self._audio_leases: dict[str, float | None] = {}
         self._character_loaded = False
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._config.render_timeout_seconds))
         return self._client
 
     @property
@@ -67,16 +86,23 @@ class AstrBotMediaRenderer:
         )
 
     async def initialize(self) -> None:
+        try:
+            await asyncio.wait_for(self._initialize(), self._config.render_timeout_seconds)
+        except TimeoutError:
+            self._logger.warning("Alice media: initialization budget exhausted")
+
+    async def _initialize(self) -> None:
         self._cleanup_stale()
         if not self.voice_runtime_available:
             return
         try:
-            await self._load_character()
-            if self._default_reference_available():
-                await self._set_reference(
-                    self._config.default_ref_audio,
-                    self._config.default_ref_text,
-                )
+            async with _backend_lock(self._base_url, self._config.character_name):
+                await self._load_character()
+                if self._default_reference_available():
+                    await self._set_reference(
+                        self._config.default_ref_audio,
+                        self._config.default_ref_text,
+                    )
             self._logger.info("Alice media: Genie character initialized")
         except Exception as exc:
             self._logger.warning(
@@ -97,9 +123,34 @@ class AstrBotMediaRenderer:
         self._character_loaded = True
 
     def _cleanup_stale(self) -> None:
+        cutoff = time.time() - 86400.0
         for item in self._temp_dir.glob("alice_tts_*.wav"):
             try:
-                item.unlink()
+                if not item.is_symlink() and item.is_file() and item.stat().st_mtime < cutoff:
+                    item.unlink()
+            except OSError:
+                pass
+
+    def release(self, audio_path: str) -> None:
+        """Release only this renderer's output, with an upload grace period.
+
+        A yielded Record is not a platform receipt. Keep released files for at
+        least five minutes; never evict another active render's file.
+        """
+        if audio_path in self._audio_leases:
+            self._audio_leases[audio_path] = time.time()
+        self._cleanup_released()
+
+    def _cleanup_released(self) -> None:
+        cutoff = time.time() - 300.0
+        for name, released_at in list(self._audio_leases.items()):
+            if released_at is None or released_at > cutoff:
+                continue
+            try:
+                path = Path(name)
+                if path.parent == self._temp_dir and not path.is_symlink():
+                    path.unlink(missing_ok=True)
+                self._audio_leases.pop(name, None)
             except OSError:
                 pass
 
@@ -188,7 +239,9 @@ class AstrBotMediaRenderer:
                 handle.setsampwidth(2)
                 handle.setframerate(32000)
                 handle.writeframes(raw)
-        return str(target)
+        path = str(target)
+        self._audio_leases[path] = None
+        return path
 
     async def _synthesize(self, text: str) -> str:
         for attempt in range(2):
@@ -212,6 +265,21 @@ class AstrBotMediaRenderer:
         raise RuntimeError("Genie TTS failed after resetting reference audio")
 
     async def render(
+        self, session_id: str, response_text: str, decision: MediaDecision | None,
+    ) -> RenderedMedia:
+        try:
+            return await asyncio.wait_for(
+                self._render(session_id, response_text, decision),
+                timeout=self._config.render_timeout_seconds,
+            )
+        except TimeoutError:
+            self._logger.warning("Alice media: render budget exhausted; continuing with text")
+            emoji = None
+            if decision and decision.send_emoji and decision.emoji and Path(decision.emoji.path).is_file():
+                emoji = decision.emoji.path
+            return RenderedMedia(emoji_path=emoji, timed_out=True)
+
+    async def _render(
         self,
         session_id: str,
         response_text: str,
@@ -224,51 +292,51 @@ class AstrBotMediaRenderer:
             emoji_path = decision.emoji.path
 
         audio_path = None
+        prepared = None
         if decision.send_voice and self.voice_runtime_available:
             try:
-                if not self._character_loaded:
-                    await self._load_character()
                 reference_path = self._config.default_ref_audio
                 reference_text = self._config.default_ref_text
                 if decision.voice is not None:
                     reference_path = decision.voice.path
                     reference_text = decision.voice.reference_text
-                if reference_path and reference_text and Path(reference_path).is_file():
-                    if reference_path != self._current_ref_path or reference_text != self._current_ref_text:
-                        await self._set_reference(reference_path, reference_text)
-                elif self._current_ref_path is None:
-                    raise FileNotFoundError("no usable TTS reference audio")
                 prepared = self._prepare_text(response_text, self._config.tts_max_chars)
                 if len(prepared) < 2:
                     raise ValueError("TTS response text is too short")
                 spoken = await self._translate(session_id, prepared)
-                # Log the reference that Genie actually holds, rather than a
-                # candidate path that may have fallen back to the current one.
-                if self._config.log_tts_inputs:
-                    self._logger.info(
-                        "Alice media: TTS inputs " + json.dumps(
-                            {
-                                "reference_audio": self._current_ref_path,
-                                "reference_text": self._current_ref_text,
-                                "source_text": prepared,
-                                "translated_text": spoken,
-                            },
-                            ensure_ascii=False,
+                # Translation is independent and can overlap other sessions.
+                # The server's reference mutation and synthesis must be atomic.
+                async with _backend_lock(self._base_url, self._config.character_name):
+                    if not self._character_loaded:
+                        await self._load_character()
+                    if not (reference_path and reference_text and Path(reference_path).is_file()):
+                        reference_path = self._config.default_ref_audio or self._current_ref_path
+                        reference_text = self._config.default_ref_text or self._current_ref_text
+                    if not (reference_path and reference_text):
+                        raise FileNotFoundError("no usable TTS reference audio")
+                    # Always set the chosen reference: another renderer sharing
+                    # this backend may have changed it since our previous turn.
+                    await self._set_reference(reference_path, reference_text)
+                    if self._config.log_tts_inputs:
+                        self._logger.info(
+                            "Alice media: TTS inputs " + json.dumps(
+                                {
+                                    "reference_audio": self._current_ref_path,
+                                    "reference_text": self._current_ref_text,
+                                    "source_text": prepared,
+                                    "translated_text": spoken,
+                                },
+                                ensure_ascii=False,
+                            )
                         )
-                    )
-                audio_path = await self._synthesize(spoken)
-                previous = self._last_audio_path
-                self._last_audio_path = audio_path
-                if previous and previous != audio_path and os.path.isfile(previous):
-                    try:
-                        os.remove(previous)
-                    except OSError:
-                        pass
+                    audio_path = await self._synthesize(spoken)
+                self._cleanup_released()
             except Exception as exc:
                 self._logger.warning(
                     f"Alice media: TTS failed safely ({type(exc).__name__})"
                 )
-        return RenderedMedia(audio_path=audio_path, emoji_path=emoji_path)
+        return RenderedMedia(audio_path=audio_path, emoji_path=emoji_path,
+                             spoken_source_text=prepared if audio_path else None)
 
     async def close(self) -> None:
         if self._owns_client and self._client is not None:

@@ -13,6 +13,9 @@ class AlicePrivateMessageFilter(CustomFilter):
         raw_text = str(raw_text or "").strip()
         if not raw_text:
             return False
+        command = raw_text.lstrip("/").split(maxsplit=1)
+        if command and command[0].lower() in {"alice-status", "alice-data"}:
+            return False
         wake_prefixes = cfg.get("wake_prefix", []) if hasattr(cfg, "get") else []
         if isinstance(wake_prefixes, str):
             wake_prefixes = [wake_prefixes]

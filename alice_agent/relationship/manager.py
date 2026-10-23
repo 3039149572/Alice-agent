@@ -42,5 +42,12 @@ class RelationshipManager:
         if self._enabled:
             await self._store.add_shared_experience(experience)
 
+    async def update_once(self, event: AgentEvent, perception: PerceptionResult, operation_id: str) -> RelationshipState:
+        if not self._enabled:
+            return await self.get(event.user_id)
+        lock = await self._lock_for(event.user_id)
+        async with lock:
+            return await self._store.apply_once(event.user_id, operation_id, lambda old: self._reducer.reduce(old, perception, event))
+
     async def close(self) -> None:
         await self._store.close()

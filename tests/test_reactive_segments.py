@@ -71,6 +71,7 @@ def _make_plugin(
         "segmented_send_enabled": True,
         "segmented_send_max_chars": 50,
         "segmented_send_interval_seconds": 0.25,
+        "media_text_first": False,  # Explicitly exercise the compatibility ordering.
         **config_overrides,
     }
     with patch.object(
@@ -99,6 +100,18 @@ def _make_plugin(
 
 
 class ReactiveSegmentIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closing_outer_handler_finalizes_only_the_already_yielded_prefix(self):
+        text = "甲" * 45 + "。" + "乙" * 45 + "。"
+        plugin = _make_plugin(self, lambda _event: AgentResponse(text, "close-trace"), segmented_send_interval_seconds=0)
+        event = FakeEvent("incoming")
+        stream = plugin.on_private_message(event)
+        first = await anext(stream)
+        await stream.aclose()
+        history = plugin._session_manager.history(event.unified_msg_origin)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].assistant_text, _plain_text(first))
+        self.assertEqual(history[0].assistant_text, "甲" * 45 + "。")
+
     async def test_qq_official_sends_voice_as_own_message_before_whole_sentences(self) -> None:
         timeline: list[tuple[str, object]] = []
         event = QQOfficialEvent("incoming", timeline)

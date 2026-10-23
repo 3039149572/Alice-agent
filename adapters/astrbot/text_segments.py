@@ -8,6 +8,25 @@ _SENTENCE_END = re.compile(r"[.!?。！？…]+[\"'’”」』）)】》]*[ \t]
 _FENCE_LINE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 
 
+def split_bounded_text(text: str, max_chars: int = 1000) -> list[str]:
+    """Hard-bound plain management output, preferring intact newline records.
+
+    Generated prose uses the separate soft sentence/fence-preserving splitter.
+    A journal row can be arbitrarily long without any sentence boundary.
+    """
+    limit = max(1, int(max_chars))
+    result, start = [], 0
+    while start < len(text):
+        end = min(len(text), start + limit)
+        if end < len(text):
+            newline = text.rfind("\n", start, end)
+            if newline > start:
+                end = newline + 1
+        result.append(text[start:end])
+        start = end
+    return result
+
+
 def _fenced_ranges(text: str) -> list[tuple[int, int]]:
     """Return complete fenced-code ranges, including their fence lines."""
     ranges: list[tuple[int, int]] = []

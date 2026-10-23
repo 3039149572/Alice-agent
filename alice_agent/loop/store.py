@@ -23,6 +23,7 @@ class InMemoryAutonomyStore:
         self.actions: dict[str, CandidateAction] = {}
         self.daily_proactive: dict[tuple[str, str], dict[str, Any]] = {}
         self.daily_decisions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._delivery_operations: set[str] = set()
 
     async def get_daily_proactive_decision(self, session_id: str, day: str):
         value = self.daily_decisions.get((session_id, day))
@@ -46,6 +47,18 @@ class InMemoryAutonomyStore:
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         return [dict(session_id=key, **value) for key, value in self.sessions.items() if value.get("active", True)]
+
+    async def sessions_for_user(self, user_id: str) -> list[str]:
+        return [key for key, value in self.sessions.items() if value.get("user_id") == user_id]
+
+    async def invalidate_data_context(self, user_id: str, session_ids: list[str]) -> None:
+        sessions = set(session_ids)
+        self.scheduled = {key: value for key, value in self.scheduled.items() if not (value.user_id == user_id and value.session_id in sessions)}
+        self.actions = {key: value for key, value in self.actions.items() if value.metadata.get("session_id") not in sessions}
+        self.daily_decisions = {key: value for key, value in self.daily_decisions.items() if key[0] not in sessions}
+        for session in sessions:
+            if session in self.sessions:
+                self.sessions[session]["revision"] += 1
 
     async def update_tick(self, session_id: str, timestamp: float) -> None:
         if session_id in self.sessions:
@@ -132,6 +145,19 @@ class InMemoryAutonomyStore:
             if action.metadata.get("session_id") == session_id and action.status.value in {"candidate", "planned", "executing"}:
                 action.status = ActionStatus.CANCELLED
 
+    async def commit_delivery_once(self, operation_id: str, payload: dict) -> None:
+        if operation_id in self._delivery_operations:
+            return
+        event, action = payload["event"], dict(payload["action"])
+        await self.record_send(event["user_id"], event["session_id"], action.get("topic"), event["timestamp"])
+        if payload["daily_day"] and payload["daily_event_id"]:
+            await self.record_daily_proactive_delivery(event["session_id"], payload["daily_day"], payload["daily_event_id"])
+        action["status"] = ActionStatus(action["status"])
+        self.actions[action["action_id"]] = CandidateAction(**action)
+        if payload["scheduled_id"] in self.scheduled:
+            self.scheduled[payload["scheduled_id"]].status = "evaluated"
+        self._delivery_operations.add(operation_id)
+
     async def close(self) -> None:
         return None
 
@@ -199,7 +225,58 @@ class SQLiteAutonomyStore:
                     session_id TEXT NOT NULL, day TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(session_id,day)
                 );
+                CREATE TABLE IF NOT EXISTS autonomy_delivery_operations (
+                    operation_id TEXT PRIMARY KEY
+                );
             """)
+
+    async def sessions_for_user(self, user_id: str) -> list[str]:
+        def query():
+            with closing(self._connect()) as db:
+                return [row[0] for row in db.execute("SELECT session_id FROM autonomy_sessions WHERE user_id=?", (user_id,))]
+        return await self._run(query)
+
+    async def invalidate_data_context(self, user_id: str, session_ids: list[str]) -> None:
+        def query():
+            with closing(self._connect()) as db, db:
+                for session in set(session_ids):
+                    db.execute("DELETE FROM proactive_actions WHERE session_id=?", (session,))
+                    db.execute("DELETE FROM daily_proactive_decisions WHERE session_id=?", (session,))
+                    db.execute("UPDATE autonomy_sessions SET revision=revision+1 WHERE user_id=? AND session_id=?", (user_id, session))
+                for row in db.execute("SELECT id,payload FROM scheduled_context_events").fetchall():
+                    value = json.loads(row["payload"])
+                    if value.get("user_id") == user_id and value.get("session_id") in session_ids:
+                        db.execute("DELETE FROM scheduled_context_events WHERE id=?", (row["id"],))
+        await self._run(query)
+
+    async def commit_delivery_once(self, operation_id: str, payload: dict) -> None:
+        def query():
+            with closing(self._connect()) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("SELECT 1 FROM autonomy_delivery_operations WHERE operation_id=?", (operation_id,)).fetchone():
+                    return
+                event, action = payload["event"], payload["action"]
+                session, stamp = event["session_id"], event["timestamp"]
+                db.execute("INSERT INTO proactive_sends(user_id,session_id,topic,sent_at) VALUES (?,?,?,?)", (event["user_id"], session, action.get("topic") or "", stamp))
+                db.execute("INSERT INTO proactive_session_state VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET last_sent_at=MAX(last_sent_at,excluded.last_sent_at)", (session, stamp))
+                day, daily_id = payload["daily_day"], payload["daily_event_id"]
+                if day and daily_id:
+                    db.execute("INSERT OR IGNORE INTO daily_proactive_state(session_id,day) VALUES (?,?)", (session, day))
+                    row = db.execute("SELECT delivered_event_ids FROM daily_proactive_state WHERE session_id=? AND day=?", (session, day)).fetchone()
+                    delivered = json.loads(row[0])
+                    if daily_id not in delivered:
+                        delivered.append(daily_id)
+                    db.execute("UPDATE daily_proactive_state SET delivered_event_ids=? WHERE session_id=? AND day=?", (json.dumps(delivered), session, day))
+                db.execute("INSERT INTO proactive_actions VALUES (?,?,?,?) ON CONFLICT(action_id) DO UPDATE SET status=excluded.status,payload=excluded.payload",
+                           (action["action_id"], session, action["status"], json.dumps(action, ensure_ascii=False)))
+                if payload["scheduled_id"]:
+                    row = db.execute("SELECT payload FROM scheduled_context_events WHERE id=?", (payload["scheduled_id"],)).fetchone()
+                    if row:
+                        scheduled = json.loads(row[0])
+                        scheduled["status"] = "evaluated"
+                        db.execute("UPDATE scheduled_context_events SET status='evaluated',payload=? WHERE id=?", (json.dumps(scheduled, ensure_ascii=False), payload["scheduled_id"]))
+                db.execute("INSERT INTO autonomy_delivery_operations VALUES (?)", (operation_id,))
+        await self._run(query)
 
     async def get_daily_proactive_decision(self, session_id: str, day: str):
         def query():

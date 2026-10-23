@@ -10,10 +10,17 @@ class AgentConfig:
     enabled: bool = True
     debug: bool = False
     llm_timeout: float = 30.0
+    turn_timeout: float = 60.0
+    llm_provider_attempt_timeout: float = 15.0
+    llm_fallback_reserve_seconds: float = 5.0
     perception_enabled: bool = True
     planner_enabled: bool = True
     memory_enabled: bool = True
     memory_metadata_enabled: bool = True
+    memory_fact_extraction_enabled: bool = True
+    memory_retention_days: float = 0.0
+    memory_journal_retention_days: float = 0.0
+    memory_inactive_fact_retention_days: float = 0.0
     memory_backend: str = "local_sqlite"
     history_limit: int = 8
     session_persistence_enabled: bool = True
@@ -80,6 +87,8 @@ class AgentConfig:
     jev_timeout_ms: int = 2500
     jev_auto_threshold: float = 0.85
     jev_review_threshold: float = 0.80
+    jev_task_policies: dict[str, Any] = field(default_factory=dict)
+    jev_affect_intervention_enabled: bool = False
     jev_perception_enabled: bool = True
     jev_memory_enabled: bool = True
     jev_planner_enabled: bool = True
@@ -88,6 +97,29 @@ class AgentConfig:
     fallback_text: str = "抱歉，我刚刚没能组织好回应。可以再说一遍吗？"
 
     def __post_init__(self) -> None:
+        for name in ("memory_retention_days", "memory_journal_retention_days", "memory_inactive_fact_retention_days"):
+            try:
+                raw_value = getattr(self, name)
+                value = 0.0 if isinstance(raw_value, bool) else float(raw_value)
+            except (ValueError, TypeError, OverflowError):
+                value = 0.0
+            object.__setattr__(self, name, min(36500.0, max(0.0, value)) if math.isfinite(value) else 0.0)
+        allowed_tasks = {"perception", "memory", "planner", "proactive", "media", "daily_event", "response_timing"}
+        policies = {}
+        if isinstance(self.jev_task_policies, dict):
+            for task, settings in self.jev_task_policies.items():
+                if task not in allowed_tasks or not isinstance(settings, dict):
+                    continue
+                clean = {}
+                if settings.get("mode") in {"off", "shadow", "hybrid", "primary"}:
+                    clean["mode"] = settings["mode"]
+                for key in ("auto_threshold", "review_threshold"):
+                    value = settings.get(key)
+                    if type(value) in (int, float) and math.isfinite(value):
+                        clean[key] = min(1.0, max(0.80, float(value)))
+                if clean:
+                    policies[task] = clean
+        object.__setattr__(self, "jev_task_policies", policies)
         from .knowledge.novel import NovelContextConfig
         novel = NovelContextConfig(
             stage=self.novel_context_stage, fact_limit=self.novel_fact_limit,
@@ -98,6 +130,15 @@ class AgentConfig:
         object.__setattr__(self, "novel_dialogue_limit", novel.dialogue_limit)
         object.__setattr__(self, "novel_context_max_chars", novel.max_chars)
         object.__setattr__(self, "llm_timeout", max(1.0, float(self.llm_timeout)))
+        for name, default in (("turn_timeout", 60.0), ("llm_provider_attempt_timeout", 15.0),
+                              ("llm_fallback_reserve_seconds", 5.0)):
+            try:
+                value = float(getattr(self, name))
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            if not math.isfinite(value):
+                value = default
+            object.__setattr__(self, name, min(600.0, max(0.05, value)))
         object.__setattr__(self, "history_limit", max(0, int(self.history_limit)))
         object.__setattr__(self, "session_persistence_enabled", bool(self.session_persistence_enabled))
         try:

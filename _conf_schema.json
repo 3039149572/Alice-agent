@@ -131,6 +131,26 @@
     "type": "float",
     "default": 30.0
   },
+  "turn_timeout": {
+    "description": "每轮生成的总计算预算（秒，包含各模型阶段及排队；分段发送间隔另计）",
+    "type": "float", "default": 60.0
+  },
+  "llm_provider_attempt_timeout": {
+    "description": "存在备用模型时单个Provider的最长尝试时间（秒，不增加原总时限）",
+    "type": "float", "default": 15.0
+  },
+  "llm_fallback_reserve_seconds": {
+    "description": "为后续备用模型预留的共享总预算（秒，最多为当前剩余时间的一半）",
+    "type": "float", "default": 5.0
+  },
+  "media_text_first": {
+    "description": "文字与语音同时发送时，先发文字再补语音；关闭可恢复先合成的顺序",
+    "type": "bool", "default": true
+  },
+  "media_render_timeout_seconds": {
+    "description": "媒体初始化或单次生成总等待预算（秒，含翻译、排队和Genie请求）",
+    "type": "float", "default": 12.0
+  },
   "perception_enabled": {
     "description": "启用 Perception LLM 阶段",
     "type": "bool",
@@ -195,6 +215,25 @@
     "type": "float",
     "default": 0.12
   },
+  "memory_retention_days": {
+    "description": "长期记忆保留天数（0保留；按创建/修改较晚时间计算；固定记忆不自动删除）",
+    "type": "float",
+    "default": 0.0
+  },
+  "memory_journal_retention_days": {
+    "description": "原始轮次保留天数（0保留；事实内容及证据另受记忆保留策略控制）",
+    "type": "float",
+    "default": 0.0
+  },
+  "memory_inactive_fact_retention_days": {
+    "description": "被替代/迟到事实版本保留天数（0保留；不删除当前版本及固定版本）",
+    "type": "float",
+    "default": 0.0
+  },
+  "memory_fact_extraction_enabled": {
+    "description": "从明确的当前用户自述提取有限类型事实，保留来源、去重和修正版本（无额外模型调用，疑问/假设/引述不提取）",
+    "type": "bool", "default": true
+  },
   "memory_semantic_weight": {
     "description": "Rerank 检索相关度权重",
     "type": "float",
@@ -245,7 +284,7 @@
     "hint": "原始轮次只写入本机 SQLite 日志表；只有通过重要度门控的候选才会进入可召回长期记忆。"
   },
   "local_memory_candidate_limit": {
-    "description": "单次本地相关度计算最多读取的候选数",
+    "description": "本地全库索引检索的单批读取数量（不限制历史范围）",
     "type": "int",
     "default": 300
   },
@@ -345,6 +384,15 @@
     "description": "Jev 决策最低采用置信度；实际下限固定为 0.80。有对应 LLM 路径时低于下限回退；有双路数值时先混合",
     "type": "float",
     "default": 0.80
+  },
+  "jev_task_policies": {
+    "description": "按任务覆盖Jev模式及阈值的JSON（perception/memory/planner/proactive/media/daily_event/response_timing）",
+    "type": "text", "default": "{}",
+    "hint": "例如 {\"planner\":{\"mode\":\"hybrid\",\"auto_threshold\":0.9,\"review_threshold\":0.85}}；未指定继承全局，最低采用下限仍为0.80。"
+  },
+  "jev_affect_intervention_enabled": {
+    "description": "允许Jev情绪数值干预最终感知（默认false，shadow保持观测；true恢复旧版混合行为）",
+    "type": "bool", "default": false
   },
   "vad_enabled": {
     "description": "使用本地 VAD 模型作为用户情绪基线；不可用时回退现有 Perception",

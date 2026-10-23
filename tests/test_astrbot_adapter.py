@@ -130,11 +130,20 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         await plugin.initialize()
         task = plugin._agent_loop._task
+        audit_task = plugin._proactive_audit._task
+        self.assertTrue(plugin._proactive_audit.path.is_file())
         await plugin.initialize()
         self.assertIs(plugin._agent_loop._task, task)
+        self.assertIs(plugin._proactive_audit._task, audit_task)
         self.assertTrue(plugin._agent_loop.running)
+        close_data = plugin._data_service.close
+        async def close_after_output_stopped():
+            self.assertFalse(plugin._agent_loop.running)
+            await close_data()
+        plugin._data_service.close = close_after_output_stopped
         await plugin.terminate()
         self.assertFalse(plugin._agent_loop.running)
+        self.assertTrue(audit_task.done())
 
     async def test_handler_registration_keeps_priority_and_both_filters(self) -> None:
         handlers = [
@@ -178,7 +187,7 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.stopped)
         await plugin.terminate()
 
-    async def test_handler_emits_record_and_text_chain_when_tts_succeeds(self) -> None:
+    async def test_handler_emits_text_then_standalone_record_when_tts_succeeds(self) -> None:
         event = FakeEvent()
         plugin = AliceAgentPlugin(
             FakeContext(), {"memory_enabled": False, "memory_backend": "in_memory", "vad_enabled": False,
@@ -187,10 +196,11 @@ class AstrBotAdapterTests(unittest.IsolatedAsyncioTestCase):
         await plugin._media_renderer.close()
         plugin._media_renderer = FakeMediaRenderer()
         generator = plugin.on_private_message(event)
+        self.assertEqual(await anext(generator), ("plain", "你好，我在。"))
         kind, chain = await anext(generator)
         self.assertEqual(kind, "chain")
         self.assertEqual(chain[0].__class__.__name__, "Record")
-        self.assertEqual(chain[1].__class__.__name__, "Plain")
+        self.assertEqual(len(chain), 1)
         with self.assertRaises(StopAsyncIteration):
             await anext(generator)
         self.assertTrue(event.stopped)

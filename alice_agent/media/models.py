@@ -63,8 +63,18 @@ class MediaConfig:
     tts_max_chars: int = 80
     emoji_delay_seconds: float = 0.5
     log_tts_inputs: bool = False
+    text_first: bool = True
+    render_timeout_seconds: float = 12.0
 
     def __post_init__(self) -> None:
+        import math
+        try:
+            timeout = float(self.render_timeout_seconds)
+        except (TypeError, ValueError, OverflowError):
+            timeout = 12.0
+        if not math.isfinite(timeout):
+            timeout = 12.0
+        object.__setattr__(self, "render_timeout_seconds", min(120.0, max(0.05, timeout)))
         object.__setattr__(self, "min_chars", max(1, int(self.min_chars)))
         object.__setattr__(self, "cooldown_seconds", max(0.0, float(self.cooldown_seconds)))
         for name in (
