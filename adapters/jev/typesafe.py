@@ -52,21 +52,24 @@ class TypesafeJevAdapter:
         if not isinstance(raw, dict):
             raise DecisionValidationError("answer must be an object")
         answer_type = raw.get("type")
-        if answer_type not in {"choice", "score", "noul"}:
+        if not isinstance(answer_type, str) or answer_type not in {"choice", "score", "noul"}:
             raise DecisionValidationError("unknown answer type")
         probabilities = raw.get("probabilities", {})
         legend = raw.get("legend", {})
         if not isinstance(probabilities, dict) or not isinstance(legend, dict):
             raise DecisionValidationError("invalid answer maps")
-        return DecisionAnswer(
-            type=str(answer_type),
-            choice=str(raw["choice"]) if raw.get("choice") is not None else None,
-            score=float(raw["score"]) if raw.get("score") is not None else None,
-            noul=float(raw["noul"]) if raw.get("noul") is not None else None,
-            probabilities={str(key): float(value) for key, value in probabilities.items()},
-            confidence=float(raw["confidence"]) if raw.get("confidence") is not None else None,
-            legend={str(key): str(value) for key, value in legend.items()},
-        )
+        try:
+            return DecisionAnswer(
+                type=str(answer_type),
+                choice=str(raw["choice"]) if raw.get("choice") is not None else None,
+                score=float(raw["score"]) if raw.get("score") is not None else None,
+                noul=float(raw["noul"]) if raw.get("noul") is not None else None,
+                probabilities={str(key): float(value) for key, value in probabilities.items()},
+                confidence=float(raw["confidence"]) if raw.get("confidence") is not None else None,
+                legend={str(key): str(value) for key, value in legend.items()},
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DecisionValidationError("answer contains invalid numbers") from exc
 
     async def decide(
         self,
@@ -92,7 +95,7 @@ class TypesafeJevAdapter:
         except httpx.HTTPError as exc:
             raise DecisionAPIError("System One connection failed") from exc
         if response.status_code >= 400:
-            raise DecisionAPIError(f"System One returned HTTP {response.status_code}")
+            raise DecisionAPIError(f"System One returned HTTP {response.status_code}", status_code=response.status_code)
         try:
             raw = response.json()
         except ValueError as exc:
@@ -102,6 +105,13 @@ class TypesafeJevAdapter:
         usage = raw.get("usage", {})
         if not isinstance(usage, dict):
             usage = {}
+        try:
+            token_usage = {
+                "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            }
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DecisionValidationError("usage contains invalid numbers") from exc
         return DecisionResult(
             decision_id=f"jev_{uuid4().hex}",
             trace_id=trace_id,
@@ -111,10 +121,7 @@ class TypesafeJevAdapter:
             model=str(raw.get("model", self._model)),
             latency_ms=(time.perf_counter() - started) * 1000.0,
             answers={key: self._answer(value) for key, value in raw["answers"].items()},
-            usage={
-                "input_tokens": int(usage.get("input_tokens", 0) or 0),
-                "output_tokens": int(usage.get("output_tokens", 0) or 0),
-            },
+            usage=token_usage,
         )
 
     def _models_endpoint(self) -> str:
@@ -136,7 +143,7 @@ class TypesafeJevAdapter:
         except httpx.HTTPError as exc:
             raise DecisionAPIError("model list connection failed") from exc
         if response.status_code >= 400:
-            raise DecisionAPIError(f"model list returned HTTP {response.status_code}")
+            raise DecisionAPIError(f"model list returned HTTP {response.status_code}", status_code=response.status_code)
         try:
             payload = response.json()
         except ValueError as exc:

@@ -50,6 +50,13 @@ MESSAGES = {
     "cancelled": "主动流程被取消，已接受的前缀仍按交付机制保存",
     "evaluation_error": "会话评估异常，本轮中断，后续Tick重试",
     "loop_error": "后台循环异常，将按退避规则重试",
+    "daily_events_deferred": "当前不允许生成每日事件，仅保留已有缓存；本次没有调用事件模型",
+    "daily_event_model_start": "准备调用每日事件模型，request_task标明扩写、Jev反应或模型反应；result会记录跳过或实际结果",
+    "daily_event_model_result": "每日事件模型调用结束，status和failure_reason标明结果",
+    "attempt_claimed": "占用一次调用尝试及事件占位，失败不退还调用次数",
+    "attempt_finalized": "本次决策已有明确结果，事件不再按技术失败重试",
+    "attempt_recovered": "恢复过期的在途占位，保留调用次数并安排退避重试",
+    "retry_scheduled": "技术失败后释放事件占位，等待退避再评估；调用次数未退还",
 }
 
 REASONS = {
@@ -81,7 +88,30 @@ REASONS = {
     "new user event invalidated daily evaluation": "新用户消息使本轮概率评估失效",
     "new user event invalidated action": "新用户消息使已规划动作失效",
     "new user event invalidated generated action": "新用户消息使已生成正文失效",
+    "session_inactive": "会话超过七天未活跃",
+    "daily_events_disabled": "每日事件开关已关闭",
+    "daily_events_empty": "当天没有生成可分享事件（事件数量上限不保证产生事件）",
+    "daily_events_delivered": "当天已有事件均已发送，不再重复分享",
+    "daily_events_attempted": "当天已有事件均已处理，或被旧版本标记为已尝试；不是尝试额度耗尽",
+    "daily_events_invalid": "事件缺少有效标识，不能作为主动候选",
+    "attempt_limit": "当天调用尝试额度已用完（技术失败也计入）；不同于滚动24小时发送额度",
+    "attempt_claim_conflict": "事件占位竞争失败或额度已变化，本次没有发起后续模型调用",
+    "attempt_ownership_lost": "本次事件占位已被恢复或替换，停止旧任务，避免重复生成或发送",
+    "attempt_in_progress": "已有请求持有此事件的在途占位，等待完成或超时恢复",
+    "retry_wait": "技术失败后的退避等待中，等待时间内不会重新调用主动决策模型",
+    "scheduled_retry_limit": "此明确跟进已达到三次调用尝试上限，停止重试",
+    "daily_event_error": "每日事件读取或生成流程异常，本轮停止，后续Tick重试",
+    "daily_window_elapsed": "本轮处理期间已离开发送时段或跨日，不再发起后续日常主动模型调用",
+    "Jev proactive gate unavailable": "Jev未返回可用决策，技术失败类型见failure_reason与error_kind",
+    "Jev proactive confidence below auto threshold": "Jev决策置信度不足，明确停止本轮，不按技术失败重试",
+    "Jev safety conditions rejected send": "Jev有效决策未满足发送条件，不按技术失败重试",
+    "Jev chose defer": "Jev有效决策选择暂缓，保留原有不重试此事件的规则",
 }
+
+FAILURES = {"timeout": "调用超时", "authentication": "鉴权或权限失败",
+            "rate_limit": "供应商限流", "upstream_error": "上游服务错误",
+            "http_error": "HTTP请求失败", "connection_error": "连接或传输失败",
+            "invalid_response": "返回格式、答案或数值校验失败", "internal_error": "其他内部异常"}
 
 
 class DailyProactiveLogger:
@@ -151,6 +181,13 @@ class DailyProactiveLogger:
             reason = record.get("reason")
             if reason:
                 record["reason"] = REASONS.get(str(reason), str(reason)[:300])
+            if record.get("failure_reason"):
+                record["failure_message"] = FAILURES.get(record["failure_reason"], "未分类失败")
+            if isinstance(record.get("next_retry_at"), (int, float)):
+                try:
+                    record["next_retry_local"] = datetime.fromtimestamp(record["next_retry_at"]).isoformat()
+                except (ValueError, OSError, OverflowError):
+                    pass
             with self.path.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
 

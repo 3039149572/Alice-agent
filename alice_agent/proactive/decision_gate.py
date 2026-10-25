@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from ..decision.models import DecisionMode, DecisionType
 from ..decision.schemas import PROACTIVE_SCHEMA, proactive_questions
@@ -16,6 +16,8 @@ class ProactiveGateDecision:
     action: str
     reason: str
     shadow_action: str | None = None
+    retryable: bool = False
+    diagnostic: dict = field(default_factory=dict)
 
 
 class ProactiveDecisionGate:
@@ -39,8 +41,12 @@ class ProactiveDecisionGate:
         availability: UserAvailability,
         trace_id: str,
     ) -> ProactiveGateDecision:
+        attempt = {"mode": self._decisions.mode.value}
+        def make(action, reason, **kwargs):
+            return ProactiveGateDecision(action, reason, diagnostic=dict(attempt), **kwargs)
         if not self._enabled or not self._decisions.enabled:
-            return ProactiveGateDecision("existing", "Jev proactive gate disabled")
+            attempt["status"] = "disabled"
+            return make("existing", "Jev proactive gate disabled")
         state = {
             "candidate": {
                 "type": candidate.action_type.value,
@@ -65,21 +71,22 @@ class ProactiveDecisionGate:
             decision_type=DecisionType.PROACTIVE.value,
             schema_version=PROACTIVE_SCHEMA,
             trace_id=trace_id,
+            attempt_diagnostics=attempt,
         )
         if result is None:
             if self._decisions.mode == DecisionMode.SHADOW:
-                return ProactiveGateDecision("existing", "shadow failure does not affect behavior")
-            return ProactiveGateDecision("do_nothing", "Jev proactive gate unavailable")
+                return make("existing", "shadow failure does not affect behavior")
+            return make("do_nothing", "Jev proactive gate unavailable", retryable=True)
         answers = result.answers
         choice = answers["action"].choice or "do_nothing"
         if self._decisions.mode == DecisionMode.SHADOW:
-            return ProactiveGateDecision("existing", "shadow mode", shadow_action=choice)
+            return make("existing", "shadow mode", shadow_action=choice)
         # Proactive decisions always require the high threshold, even in primary mode.
         if (
             result.confidence < self._decisions.policy.minimum_decision_confidence
             or self._decisions.policy.classify(result.confidence) != "high"
         ):
-            return ProactiveGateDecision("do_nothing", "Jev proactive confidence below auto threshold")
+            return make("do_nothing", "Jev proactive confidence below auto threshold")
         send_probability = float(answers["action"].probabilities.get("send", 0.0))
         natural = float(answers["natural_reason_exists"].noul or 0.0)
         interruption = float(answers["likely_to_interrupt"].noul or 0.0)
@@ -97,7 +104,7 @@ class ProactiveDecisionGate:
             and deep < 0.5
         ):
             self._decisions.record_llm_avoided(DecisionType.PROACTIVE.value)
-            return ProactiveGateDecision("send", "Jev high-confidence proactive approval")
+            return make("send", "Jev high-confidence proactive approval")
         if choice == "defer":
-            return ProactiveGateDecision("defer", "Jev chose defer")
-        return ProactiveGateDecision("do_nothing", "Jev safety conditions rejected send")
+            return make("defer", "Jev chose defer")
+        return make("do_nothing", "Jev safety conditions rejected send")

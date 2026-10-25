@@ -63,6 +63,7 @@ class DailyProactiveTests(unittest.IsolatedAsyncioTestCase):
             policy = DailyProactivePolicy(InMemoryAutonomyStore(), llm=model, random_value=lambda: 0)
             decision = await policy.evaluate("s", DAY, AgentState(), EVENTS, NOW)
             self.assertEqual(decision["source"], "rule_fallback")
+            self.assertEqual(decision["failure_reason"], "invalid_response")
             self.assertTrue(decision["eligible"])
             await policy.evaluate("s", DAY, AgentState(), EVENTS, NOW)
             self.assertEqual(model.calls, 1)

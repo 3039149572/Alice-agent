@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from .models import UserAvailability
 from .policies import LocalTimeWindow
+from .attempts import select_daily_event
 
 
 REASONS = {
@@ -16,6 +17,11 @@ REASONS = {
     "probability_silence": "今天的概率判断选择安静", "score_below_threshold": "候选评分未达到门槛",
     "daily_budget": "滚动24小时预算已用完", "global_cooldown": "全局发送冷却中",
     "user_cooldown": "当前用户发送冷却中", "same_topic_cooldown": "同话题冷却中",
+    "daily_events_empty": "当天没有生成可分享事件", "daily_events_delivered": "当天事件均已发送",
+    "daily_events_attempted": "当天事件均已处理或被旧版记为已尝试，额度可能仍有余量",
+    "daily_events_invalid": "事件缺少有效标识", "retry_wait": "技术失败后的退避等待中",
+    "attempt_in_progress": "事件仍有在途占位，等待完成或恢复",
+    "scheduled_retry_limit": "此明确跟进已达到三次调用尝试上限",
 }
 
 
@@ -69,13 +75,17 @@ class ProactiveInspector:
                if item.session_id == session_id and item.user_id == user_id]
         scheduled = due[0] if due else None
         state = await loop._states.get(session_id)
-        daily = state.daily_events if state.daily_event_day == day else []
+        daily = []
+        reader = getattr(loop._daily_events, "read_cached", None)
+        if reader is not None:
+            daily = await reader(session_id, now) or []
         daily_state = await loop._store.get_daily_proactive_state(session_id, day)
         cached = await loop._store.get_daily_proactive_decision(session_id, day)
         result["daily_probability"] = {key: cached.get(key) for key in ("eligible", "probability", "roll", "source")} if cached else None
         result["daily_attempts"] = int(daily_state.get("attempt_count", 0))
         result["daily_attempt_limit"] = config.proactive_daily_attempt_limit
         result["existing_daily_event_count"] = len(daily)
+        result["event_attempts"] = daily_state.get("event_attempts", {})
         stats = await loop._store.send_stats(user_id, None, now - 86400.0, session_id)
         result["budget_24h_used"], result["budget_24h_limit"] = int(stats["daily_count"] or 0), config.proactive_daily_budget
         if not scheduled:
@@ -99,8 +109,20 @@ class ProactiveInspector:
             if cached and not cached.get("eligible"):
                 blockers.append("probability_silence")
                 conditions.append("下一本地日期重新抽签；本命令不会重抽")
-        attempted = set(daily_state.get("attempted_event_ids", [])) | set(daily_state.get("delivered_event_ids", []))
-        event = next((item for item in daily if str(item.get("event_id", "")) not in attempted), None)
+        event, event_blocker, retry_at = select_daily_event(daily, daily_state, now, config.proactive_daily_attempt_limit)
+        if not scheduled and event_blocker:
+            blockers.append(event_blocker)
+            if retry_at is not None:
+                times.append(retry_at)
+                conditions.append("等待正常Tick执行重试或恢复；本命令不会重试")
+        if scheduled:
+            retry = scheduled.metadata.get("proactive_retry", {})
+            if int(retry.get("attempt_count", 0)) >= 3:
+                blockers.append("scheduled_retry_limit")
+            retry_at = float(retry.get("lease_until" if retry.get("status") == "pending" else "next_retry_at", 0))
+            if retry_at > now:
+                blockers.append("retry_wait")
+                times.append(retry_at)
         drives = await loop._drives.get(session_id, user_id)
         availability = UserAvailability(last_interaction_time=last, known_active_session=True)
         candidate = loop._evaluator.evaluate(drives, availability, now, scheduled, daily_event=event)

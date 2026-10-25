@@ -8,6 +8,7 @@ from dataclasses import asdict
 
 from ..domain.llm import LLMRequest
 from ..perception.parser import parse_json_object
+from ..decision.fallback import DecisionValidationError, failure_details
 
 
 class DailyProactivePolicy:
@@ -41,12 +42,18 @@ class DailyProactivePolicy:
                  + 0.04 * (min(3, len(events)) - 1))
         return min(0.95, max(0.0, value))
 
-    async def evaluate(self, session_id, day, state, events, now):
+    async def evaluate(self, session_id, day, state, events, now, *, before_model=None):
         cached = await self._store.get_daily_proactive_decision(session_id, day)
         if cached is not None:
             return cached
         probability = self.rule_probability(state, events)
+        def deferred():
+            return {"probability": probability, "roll": None, "eligible": False,
+                    "source": "deferred", "deferred": True, "reason": "outside_window"}
+        if before_model is not None and not before_model():
+            return deferred()
         source, reason = "rule", "mood and daily event rule"
+        diagnostic = {"model_status": "not_used"}
         if self._llm is not None and events:
             try:
                 result = await asyncio.wait_for(self._llm.generate(LLMRequest(
@@ -67,15 +74,23 @@ class DailyProactivePolicy:
                     }, ensure_ascii=False),
                 )), timeout=self._timeout)
                 data = parse_json_object(result.text)
+                if data is None:
+                    raise DecisionValidationError("daily willingness is not an object")
                 willingness = self._number(data.get("willingness"), -1.0)
                 if not 0.0 <= willingness <= 1.0 or isinstance(data.get("willingness"), bool):
-                    raise ValueError("invalid willingness")
+                    raise DecisionValidationError("invalid willingness")
                 probability = min(0.95, max(0.0, 0.5 * probability + 0.5 * willingness))
                 source, reason = "llm_blend", str(data.get("reason", ""))[:160]
-            except Exception:
+                diagnostic["model_status"] = "ok"
+            except Exception as exc:
                 source, reason = "rule_fallback", "daily willingness model unavailable or invalid"
+                diagnostic = {"model_status": "fallback", **failure_details(exc)}
+                if isinstance(exc, (TypeError, ValueError)):
+                    diagnostic["failure_reason"] = "invalid_response"
+        if before_model is not None and not before_model():
+            return {**deferred(), **diagnostic}
         roll = self._random()
         return await self._store.save_daily_proactive_decision(session_id, day, {
             "probability": probability, "roll": roll, "eligible": roll < probability,
-            "source": source, "reason": reason, "created_at": now,
+            "source": source, "reason": reason, "created_at": now, **diagnostic,
         })

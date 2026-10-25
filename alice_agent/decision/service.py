@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from ..ports.logging import LoggerPort, NullLogger
 from ..ports.storage import StoragePort
-from .fallback import DecisionTimeoutError, DecisionValidationError
+from .fallback import DecisionTimeoutError, DecisionValidationError, failure_details
 from .metrics import DecisionMetrics
 from .models import DecisionMode, DecisionQuestion, DecisionResult
 from .policies import DecisionEscalationPolicy
@@ -288,7 +288,7 @@ class DecisionService:
             if attempt_diagnostics is not None:
                 attempt_diagnostics.update({
                     "status": "error", "cached": False,
-                    "api_latency_ms": None, "error_kind": "DecisionTimeoutError",
+                    "api_latency_ms": None, **failure_details(DecisionTimeoutError()),
                     "input_hash": input_hash, "model": resolved_model,
                 })
             return None
@@ -303,7 +303,7 @@ class DecisionService:
             if attempt_diagnostics is not None:
                 attempt_diagnostics.update({
                     "status": "error", "cached": False,
-                    "api_latency_ms": None, "error_kind": type(exc).__name__,
+                    "api_latency_ms": None, **failure_details(exc),
                     "input_hash": input_hash, "model": resolved_model,
                 })
             return None

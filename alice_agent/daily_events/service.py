@@ -15,6 +15,8 @@ from ..persona.profile import coerce_persona_profile
 from ..knowledge.novel import has_childhood_recollection
 from ..perception.parser import parse_json_object
 from ..ports.logging import LoggerPort, NullLogger
+from ..proactive.policies import LocalTimeWindow
+from ..decision.fallback import failure_details, DecisionValidationError
 
 
 _TEMPLATES: dict[str, tuple[str, str, dict[str, float]]] = {
@@ -95,6 +97,9 @@ class DailyEventService:
         llm_enabled: bool = True,
         jev_enabled: bool = True,
         logger: LoggerPort | None = None,
+        generation_window: LocalTimeWindow | None = None,
+        clock=None,
+        audit=None,
     ) -> None:
         self._storage = storage
         self._states = state_manager
@@ -109,6 +114,14 @@ class DailyEventService:
         self._llm_enabled = bool(llm_enabled)
         self._jev_enabled = bool(jev_enabled)
         self._logger = logger or NullLogger()
+        self._generation_window, self._clock, self._audit_sink = generation_window, clock, audit
+
+    async def _audit(self, stage, **details):
+        if self._audit_sink is not None:
+            try:
+                await self._audit_sink.record(stage, **details)
+            except Exception:
+                self._logger.warning("Alice daily-event diagnostic failed safely")
 
     @staticmethod
     def _rng(session_id: str, day: str) -> random.Random:
@@ -219,30 +232,49 @@ class DailyEventService:
             return fallback
         return text
 
-    async def _expand(self, session_id: str, seed: dict[str, Any], prior_user_text: str | None) -> str:
+    async def _expand(self, session_id: str, seed: dict[str, Any], prior_user_text: str | None,
+                      *, before_model=None) -> str:
         fallback = str(seed["event_seed"])
         if not self._llm_enabled:
             return fallback
+        details = {"session_id": session_id, "request_task": "daily_event", "day": seed.get("day")}
+        await self._audit("daily_event_model_start", **details)
         try:
             system_prompt, prompt = self._contexts.for_daily_event(
                 seed, prior_user_text if seed["category"] == "user_related" else None
             )
+            if before_model is not None and not before_model():
+                await self._audit("daily_event_model_result", **details, status="skipped", reason_code="outside_window")
+                return fallback
             result = await self._llm.generate(LLMRequest(
                 stage="daily_event", session_id=session_id,
                 system_prompt=system_prompt, prompt=prompt,
             ))
-            return self._safe_text(result.text, fallback, str(seed["category"]))
+            text = self._safe_text(result.text, fallback, str(seed["category"]))
+            await self._audit("daily_event_model_result", **details, status="ok" if text == result.text.strip().strip('"“”\'') else "template_fallback",
+                              used_template=text != result.text.strip().strip('"“”\''))
+            return text
         except Exception as exc:
+            await self._audit("daily_event_model_result", **details, status="error", **failure_details(exc))
             self._logger.warning(f"Alice daily event LLM fallback ({type(exc).__name__})")
             return fallback
 
     async def _reaction(
         self, seed: dict[str, Any], text: str, state: object, trace_id: str,
         *, session_id: str = "",
+        before_model=None,
     ) -> tuple[dict[str, float], float, str]:
         baseline = {axis: float(_TEMPLATES[str(seed["category"])][2].get(axis, 0.0)) for axis in _AXES}
         if not self._jev_enabled or not getattr(self._decisions, "enabled", False):
             return baseline, 0.35, "bounded_rule"
+        attempt = {}
+        await self._audit("daily_event_model_start", session_id=session_id,
+                          request_task="daily_event_reaction_jev", trace_id=trace_id)
+        if before_model is not None and not before_model():
+            await self._audit("daily_event_model_result", session_id=session_id,
+                              request_task="daily_event_reaction_jev", trace_id=trace_id,
+                              status="skipped", reason_code="outside_window")
+            return baseline, 0.35, "outside_window_rule"
         try:
             result = await self._decisions.decide(
                 {
@@ -257,14 +289,21 @@ class DailyEventService:
                 decision_type=DecisionType.DAILY_EVENT.value,
                 schema_version=DAILY_EVENT_SCHEMA,
                 trace_id=trace_id,
+                attempt_diagnostics=attempt,
             )
+            await self._audit("daily_event_model_result", session_id=session_id,
+                              request_task="daily_event_reaction_jev", trace_id=trace_id,
+                              **({"status": "ok" if result is not None else "unavailable", **attempt}))
         except Exception as exc:
+            await self._audit("daily_event_model_result", session_id=session_id,
+                              request_task="daily_event_reaction_jev", trace_id=trace_id,
+                              status="error", **failure_details(exc))
             self._logger.warning(f"Alice daily event Jev fallback ({type(exc).__name__})")
             result = None
         if self._decisions.mode == DecisionMode.SHADOW:
             return baseline, 0.35, "bounded_rule_shadow_jev"
         if result is None:
-            llm_score = await self._llm_reaction(session_id, seed, text, state)
+            llm_score = await self._llm_reaction(session_id, seed, text, state, before_model=before_model)
             if llm_score is not None:
                 self._decisions.record_escalation(DecisionType.DAILY_EVENT.value)
                 return llm_score[0], llm_score[1], "llm_fallback"
@@ -288,7 +327,7 @@ class DailyEventService:
             < self._decisions.policy.minimum_decision_confidence
         }
         if low_numeric_keys:
-            llm_score = await self._llm_reaction(session_id, seed, text, state)
+            llm_score = await self._llm_reaction(session_id, seed, text, state, before_model=before_model)
             if llm_score is None:
                 return baseline, 0.35, "bounded_rule_low_confidence_jev"
             self._decisions.record_escalation(DecisionType.DAILY_EVENT.value)
@@ -318,8 +357,14 @@ class DailyEventService:
 
     async def _llm_reaction(
         self, session_id: str, seed: dict[str, Any], text: str, state: object,
+        *, before_model=None,
     ) -> tuple[dict[str, float], float] | None:
         if not self._llm_enabled:
+            return None
+        details = {"session_id": session_id, "request_task": "daily_event_reaction", "day": seed.get("day")}
+        await self._audit("daily_event_model_start", **details)
+        if before_model is not None and not before_model():
+            await self._audit("daily_event_model_result", **details, status="skipped", reason_code="outside_window")
             return None
         try:
             system_prompt, prompt = self._contexts.for_daily_event_reaction(seed, text, state)
@@ -329,26 +374,52 @@ class DailyEventService:
             ))
             data = parse_json_object(result.text)
             if data is None:
-                return None
-            values = {key: float(data[key]) for key in (*_AXES, "importance")}
+                raise DecisionValidationError("daily event reaction is not an object")
+            try:
+                values = {key: float(data[key]) for key in (*_AXES, "importance")}
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise DecisionValidationError("daily event reaction has invalid values") from exc
             if any(
                 isinstance(data[key], bool) or not math.isfinite(value)
                 or not (-0.12 <= value <= 0.12 if key in _AXES else 0.0 <= value <= 1.0)
                 for key, value in values.items()
             ):
-                return None
+                raise DecisionValidationError("daily event reaction is out of range")
+            await self._audit("daily_event_model_result", **details, status="ok")
             return {axis: values[axis] for axis in _AXES}, values["importance"]
         except Exception as exc:
+            await self._audit("daily_event_model_result", **details, status="error", **failure_details(exc))
             self._logger.warning(f"Alice daily event LLM score fallback ({type(exc).__name__})")
             return None
+
+    async def read_cached(self, session_id: str, timestamp: float):
+        """Read structured events without generating or applying daily mood."""
+        day = datetime.fromtimestamp(timestamp).date().isoformat()
+        record = await self._storage.get(self._NAMESPACE, f"{session_id}\0{day}")
+        if not isinstance(record, dict) or not isinstance(record.get("events"), list):
+            return None
+        return [dict(item) for item in record["events"] if isinstance(item, dict)]
 
     async def ensure(
         self, session_id: str, user_id: str, timestamp: float,
         history: list[ConversationTurn] | None = None,
+        *, diagnostics: dict | None = None,
     ) -> list[dict[str, Any]]:
+        diagnostic = diagnostics if diagnostics is not None else {}
+        diagnostic.update(source="disabled", cache_hit=False, generation_model_attempts=0)
         if not self._enabled:
             return []
         day = datetime.fromtimestamp(timestamp).date().isoformat()
+        def allowed():
+            current = self._clock() if self._clock is not None else timestamp
+            return (datetime.fromtimestamp(current).date().isoformat() == day
+                    and (self._generation_window is None or self._generation_window.contains(current)))
+        def before_model():
+            if not allowed():
+                return False
+            diagnostic["generation_model_attempts"] += 1
+            return True
+        diagnostic["generation_allowed"] = allowed()
         current_state = await self._states.get(session_id)
         if current_state.daily_event_day and current_state.daily_event_day > day:
             return []
@@ -356,7 +427,14 @@ class DailyEventService:
         record = await self._storage.get(self._NAMESPACE, key)
         if isinstance(record, dict) and isinstance(record.get("events"), list):
             events = record["events"]
+            diagnostic.update(source="cache", cache_hit=True)
         else:
+            if not allowed():
+                diagnostic.update(source="deferred", reason_code="outside_window")
+                await self._audit("daily_events_deferred", session_id=session_id, user_id=user_id,
+                                  day=day, **diagnostic)
+                return []
+            diagnostic["source"] = "generated"
             rng = self._rng(session_id, day)
             prior_day = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
             prior = await self._storage.get(self._NAMESPACE, f"{session_id}\0{prior_day}")
@@ -369,11 +447,11 @@ class DailyEventService:
                     rng, index, day, prior_events, prior_user_text,
                     used_categories=used_categories,
                 )
-                text = await self._expand(session_id, seed, prior_user_text)
+                text = await self._expand(session_id, seed, prior_user_text, before_model=before_model)
                 state = await self._states.get(session_id)
                 event_id = hashlib.sha256(f"{key}\0{index}".encode("utf-8")).hexdigest()[:16]
                 reaction, importance, reaction_source = await self._reaction(
-                    seed, text, state, f"daily_{event_id}", session_id=session_id
+                    seed, text, state, f"daily_{event_id}", session_id=session_id, before_model=before_model
                 )
                 events.append({
                     "event_id": event_id,
@@ -397,7 +475,11 @@ class DailyEventService:
                 })
             # Save the event batch before the mood update. If interrupted here,
             # the next call reuses the same batch and applies it exactly once.
+            if self._clock is not None and datetime.fromtimestamp(self._clock()).date().isoformat() != day:
+                diagnostic.update(source="expired", reason_code="daily_generation_crossed_day")
+                return []
             await self._storage.set(self._NAMESPACE, key, {"day": day, "events": events})
+        diagnostic["generation_allowed_now"] = allowed()
         await self._states.apply_daily(session_id, day, events)
         if events and current_state.daily_event_day != day:
             self._logger.info(f"Alice daily events applied day={day} session={session_id} count={len(events)}")

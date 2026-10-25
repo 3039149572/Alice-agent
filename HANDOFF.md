@@ -1,8 +1,10 @@
-# Alice Agent v0.9.2 交接文档
+# Alice Agent v0.9.3 交接文档
 
-当前源码版本：`0.9.2`。恢复基线：Git `417fc1b` / v0.9.1。此前0.10.0仅是未发布本地候选标记，本次按用户指定统一纳入0.9.2。GitHub发布状态以Release及其标签为准；服务器尚未由本次操作重载。最新验证与剩余任务必须查阅 [进度记录](docs/REPAIR_PROGRESS.md)，不要用metadata版本推断当前进程已加载。
+当前源码版本：`0.9.3`。本批恢复基线：Git `414faf5` / v0.9.2。此前0.10.0仅是未发布本地候选标记，已纳入0.9.2。GitHub发布状态以Release及其标签为准；服务器尚未由本次操作重载。最新验证与剩余任务必须查阅 [进度记录](docs/REPAIR_PROGRESS.md)，不要用metadata版本推断当前进程已加载。
 
 用户已明确暂不进行真实测试；后续模型调用次数不设用户上限，但当前不因此启动任何请求。真实模型/QQ/Genie效果仍属未验收，保留后文计划供将来继续。2026-10-23新增当日主动过程文件及发布0.9.2的授权。
+
+2026-10-24根据用户提供日志修复主动重试、每日事件生成时段和失败原因记录。技术失败释放候选但不退还调用计数，默认60秒起退避至900秒；SQLite保存新占位、所有者及重试时间，过期恢复与旧任务保护不依赖日志文本。旧版已尝试记录不能可靠区分技术失败与明确拒发，因此不自动清零或重启该事件。详见 [PROACTIVE_RETRIES](docs/PROACTIVE_RETRIES.md)。
 
 本轮授权是依次修复审计项，排除关系与角色表现改进。关系Reducer、StateReducer、角色设定、小说内容和对白触发规则未改。关系存储增加的幂等标记只保护原有计数不因恢复重复累加；历史提示投影排除内部交付ID，不调整角色规则。
 
@@ -43,6 +45,7 @@
 | `alice_agent/core/delivery_commit.py` / `proactive_delivery.py` | 被动/主动交付后的本地协调，不依赖网络/框架。 |
 | `adapters/storage/delivery_journal.py` | 意图、完成收据；完成后不保留交付正文。 |
 | `adapters/diagnostics/proactive_logger.py` | 固定 `proactive_today.log` 的UTF-8逐行JSON、同日追加、跨日原子替换和独立60秒换日检查。 |
+| `alice_agent/proactive/attempts.py` | 事件占位、有限重试、退避和纯候选筛选；运行循环与只读诊断共用筛选规则。 |
 | `adapters/memory/local_sqlite.py` / `fact_store.py` / `governance.py` | 内容、索引、事实版本与原子数据操作。 |
 | `alice_agent/memory/data_service.py` | scoped命令、确认、用户gate、后台保留和恢复。 |
 | `alice_agent/memory/metadata_store.py` | 重要度、固定/访问元数据、幂等访问计数。 |

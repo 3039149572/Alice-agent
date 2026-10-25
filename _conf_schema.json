@@ -331,6 +331,8 @@
   "proactive_window_start": {"description": "主动消息本地允许时段开始（HH:MM）", "type": "string", "default": "09:00"},
   "proactive_window_end": {"description": "主动消息本地允许时段结束（HH:MM）", "type": "string", "default": "21:00"},
   "proactive_daily_attempt_limit": {"description": "每日事件主动分享每天尝试上限", "type": "int", "default": 2},
+  "proactive_retry_base_seconds": {"description": "主动决策技术失败后的首次重试等待（秒，之后指数退避；失败仍计入尝试上限）", "type": "float", "default": 60.0},
+  "proactive_retry_max_seconds": {"description": "主动决策技术失败的退避等待上限（秒）", "type": "float", "default": 900.0},
   "active_conversation_window": {"description": "用户活跃对话保护窗口（秒）", "type": "float", "default": 900.0},
   "planner_timeout": {"description": "主动 Planner 超时（秒）", "type": "float", "default": 20.0},
   "proactive_social_weight": {"description": "主动评分 social_need 权重", "type": "float", "default": 0.18},

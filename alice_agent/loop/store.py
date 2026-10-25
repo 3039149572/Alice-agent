@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sqlite3
 from contextlib import closing
@@ -11,6 +12,7 @@ from typing import Any
 
 from ..drives.models import DriveState
 from ..proactive.models import ActionStatus, CandidateAction, ScheduledContextEvent
+from ..proactive.attempts import empty_daily_state, reserve_attempt, finish_attempt, recover_attempts
 
 
 class InMemoryAutonomyStore:
@@ -104,29 +106,22 @@ class InMemoryAutonomyStore:
         }
 
     async def get_daily_proactive_state(self, session_id: str, day: str) -> dict[str, Any]:
-        value = self.daily_proactive.get((session_id, day), {})
-        return {
-            "attempt_count": int(value.get("attempt_count", 0)),
-            "attempted_event_ids": list(value.get("attempted_event_ids", [])),
-            "delivered_event_ids": list(value.get("delivered_event_ids", [])),
-        }
+        return copy.deepcopy({**empty_daily_state(), **self.daily_proactive.get((session_id, day), {})})
 
     async def claim_daily_proactive_attempt(
-        self, session_id: str, day: str, event_id: str, limit: int
+        self, session_id: str, day: str, event_id: str, limit: int, **kwargs
     ) -> bool:
         key = (session_id, day)
-        value = self.daily_proactive.setdefault(key, {
-            "attempt_count": 0, "attempted_event_ids": [], "delivered_event_ids": [],
-        })
-        if (
-            int(limit) <= int(value["attempt_count"])
-            or event_id in value["attempted_event_ids"]
-            or event_id in value["delivered_event_ids"]
-        ):
-            return False
-        value["attempt_count"] += 1
-        value["attempted_event_ids"].append(event_id)
-        return True
+        value = self.daily_proactive.setdefault(key, empty_daily_state())
+        return reserve_attempt(value, event_id, limit, **kwargs)
+
+    async def finish_daily_proactive_attempt(self, session_id, day, event_id, claim_id, **kwargs):
+        value = self.daily_proactive.setdefault((session_id, day), empty_daily_state())
+        return copy.deepcopy(finish_attempt(value, event_id, claim_id, **kwargs))
+
+    async def recover_daily_proactive_attempts(self, session_id, day, now, **kwargs):
+        value = self.daily_proactive.setdefault((session_id, day), empty_daily_state())
+        return copy.deepcopy(recover_attempts(value, now, **kwargs))
 
     async def record_daily_proactive_delivery(
         self, session_id: str, day: str, event_id: str
@@ -224,6 +219,10 @@ class SQLiteAutonomyStore:
                 CREATE TABLE IF NOT EXISTS daily_proactive_decisions (
                     session_id TEXT NOT NULL, day TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(session_id,day)
+                );
+                CREATE TABLE IF NOT EXISTS daily_proactive_attempt_leases (
+                    session_id TEXT NOT NULL, day TEXT NOT NULL, event_id TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(session_id,day,event_id)
                 );
                 CREATE TABLE IF NOT EXISTS autonomy_delivery_operations (
                     operation_id TEXT PRIMARY KEY
@@ -406,51 +405,52 @@ class SQLiteAutonomyStore:
 
     async def get_daily_proactive_state(self, session_id: str, day: str) -> dict[str, Any]:
         def query():
+            with closing(self._connect()) as db:
+                return self._read_daily_state(db, session_id, day)
+        return await self._run(query)
+
+    @staticmethod
+    def _read_daily_state(db, session_id, day):
+        state = empty_daily_state()
+        row = db.execute("SELECT attempt_count,attempted_event_ids,delivered_event_ids "
+                         "FROM daily_proactive_state WHERE session_id=? AND day=?", (session_id, day)).fetchone()
+        if row is not None:
+            state.update(attempt_count=int(row["attempt_count"]),
+                         attempted_event_ids=json.loads(row["attempted_event_ids"]),
+                         delivered_event_ids=json.loads(row["delivered_event_ids"]))
+        state["event_attempts"] = {row["event_id"]: json.loads(row["payload"]) for row in db.execute(
+            "SELECT event_id,payload FROM daily_proactive_attempt_leases WHERE session_id=? AND day=?",
+            (session_id, day))}
+        return state
+
+    async def _mutate_daily_state(self, session_id, day, mutate):
+        def query():
             with closing(self._connect()) as db, db:
-                row = db.execute(
-                    "SELECT attempt_count,attempted_event_ids,delivered_event_ids "
-                    "FROM daily_proactive_state WHERE session_id=? AND day=?",
-                    (session_id, day),
-                ).fetchone()
-                if row is None:
-                    return {"attempt_count": 0, "attempted_event_ids": [], "delivered_event_ids": []}
-                return {
-                    "attempt_count": int(row["attempt_count"]),
-                    "attempted_event_ids": json.loads(row["attempted_event_ids"]),
-                    "delivered_event_ids": json.loads(row["delivered_event_ids"]),
-                }
+                db.execute("BEGIN IMMEDIATE")
+                state = self._read_daily_state(db, session_id, day)
+                result = mutate(state)
+                db.execute("INSERT INTO daily_proactive_state(session_id,day,attempt_count,attempted_event_ids,delivered_event_ids) "
+                           "VALUES(?,?,?,?,?) ON CONFLICT(session_id,day) DO UPDATE SET "
+                           "attempt_count=excluded.attempt_count,attempted_event_ids=excluded.attempted_event_ids,"
+                           "delivered_event_ids=excluded.delivered_event_ids",
+                           (session_id, day, state["attempt_count"], json.dumps(state["attempted_event_ids"]),
+                            json.dumps(state["delivered_event_ids"])))
+                db.executemany("INSERT INTO daily_proactive_attempt_leases(session_id,day,event_id,payload) VALUES(?,?,?,?) "
+                               "ON CONFLICT(session_id,day,event_id) DO UPDATE SET payload=excluded.payload",
+                               [(session_id, day, event_id, json.dumps(attempt)) for event_id, attempt in state["event_attempts"].items()])
+                return result
         return await self._run(query)
 
     async def claim_daily_proactive_attempt(
-        self, session_id: str, day: str, event_id: str, limit: int
+        self, session_id: str, day: str, event_id: str, limit: int, **kwargs
     ) -> bool:
-        def query():
-            with closing(self._connect()) as db, db:
-                db.execute(
-                    "INSERT OR IGNORE INTO daily_proactive_state(session_id,day) VALUES(?,?)",
-                    (session_id, day),
-                )
-                row = db.execute(
-                    "SELECT attempt_count,attempted_event_ids,delivered_event_ids "
-                    "FROM daily_proactive_state WHERE session_id=? AND day=?",
-                    (session_id, day),
-                ).fetchone()
-                attempted = json.loads(row["attempted_event_ids"])
-                delivered = json.loads(row["delivered_event_ids"])
-                if (
-                    int(limit) <= int(row["attempt_count"])
-                    or event_id in attempted
-                    or event_id in delivered
-                ):
-                    return False
-                attempted.append(event_id)
-                db.execute(
-                    "UPDATE daily_proactive_state SET attempt_count=attempt_count+1, "
-                    "attempted_event_ids=? WHERE session_id=? AND day=?",
-                    (json.dumps(attempted), session_id, day),
-                )
-                return True
-        return await self._run(query)
+        return await self._mutate_daily_state(session_id, day, lambda state: reserve_attempt(state, event_id, limit, **kwargs))
+
+    async def finish_daily_proactive_attempt(self, session_id, day, event_id, claim_id, **kwargs):
+        return await self._mutate_daily_state(session_id, day, lambda state: finish_attempt(state, event_id, claim_id, **kwargs))
+
+    async def recover_daily_proactive_attempts(self, session_id, day, now, **kwargs):
+        return await self._mutate_daily_state(session_id, day, lambda state: recover_attempts(state, now, **kwargs))
 
     async def record_daily_proactive_delivery(
         self, session_id: str, day: str, event_id: str
@@ -493,6 +493,7 @@ class SQLiteAutonomyStore:
                 db.execute("DELETE FROM proactive_sends WHERE sent_at<?", (now - 172800.0,))
                 db.execute("DELETE FROM daily_proactive_state WHERE day<?", (cutoff,))
                 db.execute("DELETE FROM daily_proactive_decisions WHERE day<?", (cutoff,))
+                db.execute("DELETE FROM daily_proactive_attempt_leases WHERE day<?", (cutoff,))
                 rows = db.execute("SELECT id,payload FROM scheduled_context_events WHERE status='scheduled'").fetchall()
                 for row in rows:
                     event = ScheduledContextEvent(**json.loads(row["payload"]))

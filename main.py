@@ -69,6 +69,7 @@ from .alice_agent.loop.scheduler import ContextScheduler
 from .alice_agent.loop.store import InMemoryAutonomyStore, SQLiteAutonomyStore
 from .alice_agent.proactive.cooldown import CooldownConfig, CooldownManager
 from .alice_agent.proactive.evaluator import ProactiveEvaluator
+from .alice_agent.proactive.policies import LocalTimeWindow
 from .alice_agent.proactive.planner import ProactivePlanner
 from .alice_agent.proactive.scorer import ActionScoreConfig, ActionScorer
 from .alice_agent.proactive.decision_gate import ProactiveDecisionGate
@@ -164,6 +165,8 @@ def _build_config(config: dict) -> AgentConfig:
         proactive_window_start=str(config.get("proactive_window_start", "09:00")),
         proactive_window_end=str(config.get("proactive_window_end", "21:00")),
         proactive_daily_attempt_limit=int(config.get("proactive_daily_attempt_limit", 2)),
+        proactive_retry_base_seconds=config.get("proactive_retry_base_seconds", 60.0),
+        proactive_retry_max_seconds=config.get("proactive_retry_max_seconds", 900.0),
         active_conversation_window=float(config.get("active_conversation_window", 900.0)),
         planner_timeout=float(config.get("planner_timeout", 20.0)),
         proactive_social_weight=float(config.get("proactive_social_weight", 0.18)),
@@ -266,6 +269,12 @@ class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
         raw_config = config if config is not None else {}
         super().__init__(context, raw_config)
         self._raw_config = raw_config
+        try:
+            self._plugin_version = next(line.split(":", 1)[1].strip() for line in
+                Path(__file__).with_name("metadata.yaml").read_text(encoding="utf-8").splitlines()
+                if line.startswith("version:"))
+        except (OSError, StopIteration):
+            self._plugin_version = "unknown"
         self._test_logging_active = True
         self._config = _build_config(raw_config)
         self._media_config = _build_media_config(raw_config)
@@ -449,6 +458,9 @@ class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
             llm_enabled=self._config.daily_event_llm_enabled,
             jev_enabled=self._config.daily_event_jev_enabled,
             logger=self.logger,
+            generation_window=LocalTimeWindow(self._config.proactive_window_start, self._config.proactive_window_end),
+            clock=SystemClock().now,
+            audit=self._proactive_audit,
         )
         history_storage = None
         if (
@@ -668,6 +680,7 @@ class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
 
     async def initialize(self) -> None:
         await self._proactive_audit.start(lambda: {
+            "plugin_version": self._plugin_version,
             "enabled": self._config.enabled, "loop_enabled": self._config.agent_loop_enabled,
             "loop_running": self._agent_loop.running, "proactive_enabled": self._config.proactive_enabled,
             "daily_events_enabled": self._config.daily_events_enabled, "event_limit": self._config.daily_event_max,
@@ -679,6 +692,10 @@ class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
             "score_threshold": self._config.proactive_score_threshold,
             "daily_score_threshold": self._config.proactive_daily_score_threshold,
             "daily_attempt_limit": self._config.proactive_daily_attempt_limit,
+            "daily_attempt_period": "local_calendar_day", "daily_budget_period": "rolling_24h",
+            "retry_base_seconds": self._config.proactive_retry_base_seconds,
+            "retry_max_seconds": self._config.proactive_retry_max_seconds,
+            "scheduled_attempt_limit": 3,
         })
         await self._data_service.start()
         await self._decision_service.start()

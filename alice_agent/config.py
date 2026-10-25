@@ -70,6 +70,8 @@ class AgentConfig:
     proactive_window_start: str = "09:00"
     proactive_window_end: str = "21:00"
     proactive_daily_attempt_limit: int = 2
+    proactive_retry_base_seconds: float = 60.0
+    proactive_retry_max_seconds: float = 900.0
     active_conversation_window: float = 900.0
     planner_timeout: float = 20.0
     proactive_social_weight: float = 0.18
@@ -197,6 +199,16 @@ class AgentConfig:
             object.__setattr__(self, name, max(0.0, float(getattr(self, name))))
         object.__setattr__(self, "proactive_daily_budget", max(0, int(self.proactive_daily_budget)))
         object.__setattr__(self, "proactive_daily_attempt_limit", max(0, int(self.proactive_daily_attempt_limit)))
+        for name, default in (("proactive_retry_base_seconds", 60.0), ("proactive_retry_max_seconds", 900.0)):
+            raw = getattr(self, name)
+            try:
+                value = float(raw) if not isinstance(raw, bool) else default
+                if not math.isfinite(value):
+                    value = default
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            object.__setattr__(self, name, min(3600.0, max(1.0, value)))
+        object.__setattr__(self, "proactive_retry_max_seconds", max(self.proactive_retry_base_seconds, self.proactive_retry_max_seconds))
         mode = str(self.jev_mode).strip().lower()
         if mode not in {"off", "shadow", "hybrid", "primary"}:
             mode = "shadow"

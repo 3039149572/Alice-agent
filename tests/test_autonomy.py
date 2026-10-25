@@ -153,6 +153,9 @@ class FakeDailyEvents:
         self.calls += 1
         return self.events
 
+    async def read_cached(self, *args, **kwargs):
+        return self.events
+
 
 def build_loop(clock: FakeClock, *, daily_budget: int = 2, active_window: float = 0.0):
     config = AgentConfig(

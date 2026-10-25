@@ -1,6 +1,30 @@
 # Reliability repair tracker
 
-## Current: v0.9.2, 2026-10-23
+## Current: v0.9.3, 2026-10-25
+
+The user authorized Jev failure retries, daily-event gating, detailed failure
+logs and a new GitHub release. Baseline: 414faf5 / published v0.9.2.
+Technical failures release newly reserved daily events after bounded persistent
+backoff without refunding request attempts or rerolling the daily decision.
+Valid refusals remain final. Scheduled follow-ups have a separate three-attempt
+retry limit. SQLite leases recover after expiry and reject stale owners.
+Daily-event models are checked against the configured local window at the
+service boundary as well as in the background loop; outside-window cache reads
+do not generate a batch. Reasons and error projections are explicit.
+
+Legacy attempted events retain their old meaning because 0.9.2 did not persist
+enough information to distinguish technical failure from valid refusal.
+No production configuration/database was edited or real-model/QQ test run.
+Local unpacked-package validation: **359 tests passed in 27.433s**, 197 Python
+sources compiled, 134 effective schema defaults and 233 package sources checked.
+The 23 new tests cover retry/restart/leases, cancellation, transaction rollback,
+legacy preservation, scheduled bounds, time boundaries and safe error details.
+After documentation updates all non-Markdown file hashes are compared with
+the tested package. Remote publication is confirmed separately through the
+tag, Release, Windows/Linux Actions results and artifact digest; it is not
+production acceptance.
+
+## Previous published batch: v0.9.2, 2026-10-23
 
 The user authorized a daily-overwritten proactive diagnostic file and GitHub
 v0.9.2 publication. This version includes the prior local-only repair batch;

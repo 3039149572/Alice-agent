@@ -1,5 +1,17 @@
 # 服务器安装与更新
 
+## v0.9.3 更新
+
+安装 [v0.9.3 Release](https://github.com/3039149572/Alice-agent/releases/tag/v0.9.3) 的 `alice-agent-source.zip`，
+或通过仓库更新/重新安装，再重载插件。先备份配置及整套插件数据。
+本版保留既有额度和抽签，新增加的技术失败重试默认60秒起退避、最长900秒，仍受当日尝试上限限制。
+每日事件不再在允许时段外新调用模型；已有缓存可读。日志细分失败类型、占位及重试时间，
+重载后从 `proactive_today.log` 的startup/heartbeat核对 `plugin_version=0.9.3`。
+
+旧版本当天“已尝试”记录缺少失败类型，升级不会清零或自动重试这些旧事件，下一日的新记录采用新机制。
+不要为重试删除数据库；详见 [主动重试与时段](docs/PROACTIVE_RETRIES.md)。
+发布GitHub不代表服务器已经更新/重载，真实模型/QQ验收仍需单独完成。
+
 ## v0.9.2 更新
 
 从 [v0.9.2 Release](https://github.com/3039149572/Alice-agent/releases/tag/v0.9.2) 下载验证后的 `alice-agent-source.zip`，或通过本仓库在AstrBot中更新/重新安装，然后重载插件。本版合并此前未发布、曾标记为0.10.0的本地修复；0.10.0从未作为远端Release发布。当前范围和验证结果见 `docs/REPAIR_PROGRESS.md`。

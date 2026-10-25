@@ -20,6 +20,8 @@ from ..memory.manager import MemoryManager
 from ..ports.logging import LoggerPort
 from ..proactive.cooldown import CooldownManager
 from ..proactive.daily_policy import DailyProactivePolicy
+from ..proactive.attempts import select_daily_event
+from ..async_utils import finish_before_cancelling
 from ..proactive.evaluator import ProactiveEvaluator
 from ..proactive.models import (
     ActionStatus,
@@ -94,6 +96,7 @@ class AgentLoop:
         self._logger = logger
         self._audit_sink = audit
         self._audit_context = ContextVar("alice_proactive_audit", default=None)
+        self._attempt_context = ContextVar("alice_proactive_attempt", default=None)
         self._decision_gate = decision_gate
         self._daily_policy = daily_policy or DailyProactivePolicy(
             store, base_probability=config.proactive_daily_probability,
@@ -242,30 +245,83 @@ class AgentLoop:
                 await self._evaluate_session(event, due_by_session.get(event.session_id))
 
     async def _do_nothing(self, reason: str, *, score: float | None = None,
-                          session_id: str = "") -> None:
+                          session_id: str = "", reason_code: str | None = None, **details) -> None:
         self.metrics.do_nothing_count += 1
         suffix = "" if score is None else f" score={score:.3f}"
         self._logger.debug(f"PROACTIVE decision=DO_NOTHING reason={reason}{suffix}")
-        await self._audit("blocked", session_id=session_id, reason=reason, score=score)
+        await self._audit("blocked", session_id=session_id, reason=reason, reason_code=reason_code or reason,
+                          score=score, **details)
         self._diagnose(session_id, reason, self._clock.now())
+
+    def _retry_options(self):
+        return {"retry_base": self._config.proactive_retry_base_seconds,
+                "retry_max": self._config.proactive_retry_max_seconds}
+
+    def _daily_window_open(self, day):
+        now = self._clock.now()
+        return self._evaluator.in_send_window(now) and datetime.fromtimestamp(now).date().isoformat() == day
+
+    async def _finish_attempt(self, *, retryable=False, error_kind=None):
+        claim = self._attempt_context.get()
+        if claim is None:
+            return True
+        now = self._clock.now()
+        if claim["kind"] == "daily":
+            result = await self._store.finish_daily_proactive_attempt(
+                claim["session_id"], claim["day"], claim["event_id"], claim["claim_id"],
+                now=now, retryable=retryable, error_kind=error_kind, **self._retry_options())
+        else:
+            current = next((item for item in await self._scheduler.due(now) if item.id == claim["event_id"]), None)
+            attempt = current.metadata.get("proactive_retry", {}) if current else {}
+            result = {"changed": False}
+            if attempt.get("claim_id") == claim["claim_id"] and attempt.get("status") == "pending":
+                attempt.update(status="retry" if retryable else "finished", lease_until=0.0)
+                if retryable:
+                    attempt["failure_count"] = int(attempt.get("failure_count", 0)) + 1
+                    delay = min(self._config.proactive_retry_max_seconds,
+                                self._config.proactive_retry_base_seconds * 2 ** min(attempt["failure_count"] - 1, 20))
+                    attempt.update(next_retry_at=now + delay, error_kind=error_kind)
+                await self._scheduler.schedule(current)
+                result = {"changed": True, **attempt}
+        self._attempt_context.set(None)
+        if result.get("changed"):
+            actual_retry = result.get("status") == "retry"
+            await self._audit("retry_scheduled" if actual_retry else "attempt_finalized",
+                              source=claim["kind"], event_id=claim["event_id"],
+                              error_type=error_kind, next_retry_at=result.get("next_retry_at"),
+                              retry_in_seconds=max(0, result.get("next_retry_at", now) - now) if actual_retry else None,
+                              failure_count=result.get("failure_count", 0), quota_refunded=False)
+        return bool(result.get("changed"))
 
     async def _evaluate_session(
         self, tick_event: AgentEvent, scheduled: ScheduledContextEvent | None
     ) -> None:
         token = self._audit_context.set({"session_id": tick_event.session_id,
                                          "user_id": tick_event.user_id, "tick_id": tick_event.event_id})
+        attempt_token = self._attempt_context.set(None)
+        abort_kind = "EvaluationAborted"
         try:
             await self._audit("evaluation", scheduled=scheduled is not None)
             await self._evaluate_session_guarded(tick_event, scheduled)
         except asyncio.CancelledError:
+            abort_kind = "CancelledError"
             await self._audit("cancelled", interrupted_stage=self._audit_context.get().get("last_stage"))
             raise
         except Exception as exc:
+            abort_kind = type(exc).__name__
             await self._audit("evaluation_error", error_type=type(exc).__name__,
                               interrupted_stage=self._audit_context.get().get("last_stage"))
             raise
         finally:
-            self._audit_context.reset(token)
+            try:
+                try:
+                    if self._attempt_context.get() is not None:
+                        await finish_before_cancelling(self._finish_attempt(retryable=True, error_kind=abort_kind))
+                except Exception:
+                    self._logger.exception("Alice proactive attempt cleanup will recover after its lease expires")
+            finally:
+                self._attempt_context.reset(attempt_token)
+                self._audit_context.reset(token)
 
     async def _evaluate_session_guarded(self, tick_event, scheduled) -> None:
         if self._data_service is None:
@@ -302,19 +358,6 @@ class AgentLoop:
         daily_events: list[dict[str, object]] = []
         async with self._sessions.lock(session_id):
             history = await self._sessions.load_history(session_id)
-            if self._daily_events is not None and recently_active:
-                await self._audit("daily_events_start", enabled=self._config.daily_events_enabled,
-                                  event_limit=self._config.daily_event_max)
-                try:
-                    events = await self._daily_events.ensure(
-                        session_id, user_id, now, history
-                    )
-                    if isinstance(events, list):
-                        daily_events = [item for item in events if isinstance(item, dict)]
-                    await self._audit("daily_events", event_count=len(daily_events))
-                except Exception as exc:
-                    await self._audit("daily_events_error", error_type=type(exc).__name__)
-                    self._logger.exception("Alice daily event tick failed safely")
             previous_drives = await self._drives.get(session_id, user_id)
             state = await self._states.advance_time(
                 session_id, elapsed,
@@ -353,7 +396,46 @@ class AgentLoop:
                 await self._do_nothing("previous proactive message is unanswered", session_id=session_id)
                 return
 
+        if scheduled:
+            retry = scheduled.metadata.get("proactive_retry", {})
+            if retry.get("status") == "pending" and float(retry.get("lease_until", 0)) <= now:
+                self._attempt_context.set({"kind": "scheduled", "event_id": scheduled.id,
+                                           "claim_id": retry["claim_id"]})
+                await self._finish_attempt(retryable=True, error_kind="AttemptLeaseExpired")
+                scheduled = next((item for item in await self._scheduler.due(now) if item.id == scheduled.id), scheduled)
+                retry = scheduled.metadata.get("proactive_retry", {})
+            if int(retry.get("attempt_count", 0)) >= 3:
+                await self._scheduler.mark_evaluated(scheduled.id)
+                await self._do_nothing("scheduled_retry_limit", session_id=session_id)
+                return
+            wait_until = float(retry.get("lease_until" if retry.get("status") == "pending" else "next_retry_at", 0))
+            if wait_until > now:
+                await self._do_nothing("retry_wait", session_id=session_id, next_retry_at=wait_until,
+                                       retry_in_seconds=wait_until - now, source="scheduled")
+                return
+        elif self._daily_events is not None and recently_active and in_send_window:
+            daily_diagnostic = {}
+            await self._audit("daily_events_start", enabled=self._config.daily_events_enabled,
+                              event_limit=self._config.daily_event_max)
+            async with self._sessions.lock(session_id):
+                try:
+                    events = await self._daily_events.ensure(session_id, user_id, now, history,
+                                                             diagnostics=daily_diagnostic)
+                    if isinstance(events, list):
+                        daily_events = [item for item in events if isinstance(item, dict)]
+                    state = await self._states.get(session_id)
+                    await self._audit("daily_events", event_count=len(daily_events), **daily_diagnostic)
+                except Exception as exc:
+                    await self._audit("daily_events_error", error_type=type(exc).__name__, reason_code="daily_event_error")
+                    await self._do_nothing("daily_event_error", session_id=session_id)
+                    self._logger.exception("Alice daily event tick failed safely")
+                    return
+
         daily_event: dict[str, object] | None = None
+        no_candidate_reason = None
+        if not scheduled and not self._daily_window_open(datetime.fromtimestamp(now).date().isoformat()):
+            await self._do_nothing("daily_window_elapsed", session_id=session_id)
+            return
         if daily_events and recently_active and in_send_window and not scheduled:
             local_day = datetime.fromtimestamp(now).date().isoformat()
             cached = await self._store.get_daily_proactive_decision(session_id, local_day)
@@ -363,26 +445,32 @@ class AgentLoop:
                 await self._do_nothing("daily probability chose silence", session_id=session_id)
                 return
             daily_state = await self._store.get_daily_proactive_state(session_id, local_day)
+            if any(item.get("status") == "pending" and float(item.get("lease_until", 0)) <= now
+                   for item in daily_state.get("event_attempts", {}).values()):
+                recovered = await self._store.recover_daily_proactive_attempts(session_id, local_day, now, **self._retry_options())
+                for item in recovered:
+                    await self._audit("attempt_recovered", **item)
+                daily_state = await self._store.get_daily_proactive_state(session_id, local_day)
             attempts = int(daily_state.get("attempt_count", 0))
             attempt_limit = max(0, int(getattr(self._config, "proactive_daily_attempt_limit", 2)))
             attempted = set(daily_state.get("attempted_event_ids", []))
             delivered = set(daily_state.get("delivered_event_ids", []))
             await self._audit("attempt", attempt_count=attempts, attempt_limit=attempt_limit,
-                              attempted_event_count=len(attempted), delivered_event_count=len(delivered))
-            if attempts < attempt_limit:
-                daily_event = next((item for item in daily_events if (
-                    str(item.get("event_id", ""))
-                    and str(item.get("event_id", "")) not in attempted
-                    and str(item.get("event_id", "")) not in delivered
-                )), None)
+                              attempted_event_count=len(attempted), delivered_event_count=len(delivered),
+                              limit_period="local_calendar_day", event_attempts=daily_state.get("event_attempts", {}))
+            daily_event, no_candidate_reason, retry_at = select_daily_event(daily_events, daily_state, now, attempt_limit)
+            if no_candidate_reason in {"retry_wait", "attempt_in_progress"}:
+                await self._do_nothing(no_candidate_reason, session_id=session_id, next_retry_at=retry_at,
+                                       retry_in_seconds=max(0, retry_at - now))
+                return
 
         if not scheduled and not daily_event:
-            no_candidate_reason = (
-                "session inactive over 7 days" if not recently_active else
-                "daily events disabled" if not self._config.daily_events_enabled else
-                "no daily events or daily attempts exhausted"
+            no_candidate_reason = no_candidate_reason or (
+                "session_inactive" if not recently_active else
+                "daily_events_disabled" if not self._config.daily_events_enabled else
+                "daily_events_empty"
             )
-            await self._audit("candidate_availability", reason=no_candidate_reason)
+            await self._audit("candidate_availability", reason=no_candidate_reason, reason_code=no_candidate_reason)
             self._diagnose(session_id, no_candidate_reason, now)
 
         candidate = self._evaluator.evaluate(
@@ -392,7 +480,7 @@ class AgentLoop:
                           source="scheduled" if scheduled else "daily_event" if daily_event else "unfinished_context",
                           action_id=candidate.action_id, reason=candidate.reason)
         if candidate.action_type == CandidateActionType.DO_NOTHING:
-            await self._do_nothing(candidate.reason, session_id=session_id)
+            await self._do_nothing(no_candidate_reason or candidate.reason, session_id=session_id)
             return
         self.metrics.candidate_actions += 1
         candidate.metadata["session_id"] = session_id
@@ -442,13 +530,23 @@ class AgentLoop:
 
         daily_event_id = str(candidate.metadata.get("daily_event_id", ""))
         daily_event_day = str(candidate.metadata.get("daily_event_day", ""))
+        lease_until = self._clock.now() + max(300.0, self._config.planner_timeout * 2
+                                             + self._config.llm_timeout * 2 + self._config.jev_timeout_ms / 1000 + 120)
         if daily_event_id and daily_event_day:
+            if not self._daily_window_open(daily_event_day):
+                await self._do_nothing("daily_window_elapsed", session_id=session_id)
+                return
             await self._audit("probability_start")
             daily_decision = await self._daily_policy.evaluate(
                 session_id, daily_event_day, state, daily_events, now,
+                before_model=lambda: self._daily_window_open(daily_event_day),
             )
             await self._audit("probability", **{k: daily_decision.get(k) for k in
-                              ("eligible", "probability", "roll", "source", "reason")})
+                              ("eligible", "probability", "roll", "source", "reason", "deferred",
+                               "model_status", "error_kind", "failure_reason", "http_status")}, cached=cached is not None)
+            if daily_decision.get("deferred"):
+                await self._do_nothing("daily_window_elapsed", session_id=session_id)
+                return
             self._diagnose(session_id, (
                 f"daily_probability={daily_decision['probability']:.3f} "
                 f"roll={daily_decision['roll']:.3f} eligible={daily_decision['eligible']} "
@@ -459,16 +557,32 @@ class AgentLoop:
                 await self._store.save_action(candidate)
                 await self._do_nothing("daily probability chose silence", session_id=session_id)
                 return
+            if not self._daily_window_open(daily_event_day):
+                await self._do_nothing("daily_window_elapsed", session_id=session_id)
+                return
             candidate.metadata["daily_decision"] = daily_decision
             attempt_limit = max(0, int(getattr(self._config, "proactive_daily_attempt_limit", 2)))
             claimed = await self._store.claim_daily_proactive_attempt(
-                session_id, daily_event_day, daily_event_id, attempt_limit
+                session_id, daily_event_day, daily_event_id, attempt_limit,
+                now=self._clock.now(), claim_id=candidate.action_id, lease_until=lease_until,
             )
             if not claimed:
                 candidate.status = ActionStatus.CANCELLED
                 await self._store.save_action(candidate)
-                await self._do_nothing("daily proactive attempt limit reached", session_id=session_id)
+                await self._do_nothing("attempt_claim_conflict", session_id=session_id)
                 return
+            self._attempt_context.set({"kind": "daily", "session_id": session_id, "day": daily_event_day,
+                                       "event_id": daily_event_id, "claim_id": candidate.action_id})
+            await self._audit("attempt_claimed", event_id=daily_event_id, claim_id=candidate.action_id,
+                              lease_until=lease_until, quota_refunded=False)
+        elif scheduled:
+            previous = scheduled.metadata.get("proactive_retry", {})
+            scheduled.metadata["proactive_retry"] = {
+                "status": "pending", "claim_id": candidate.action_id, "lease_until": lease_until,
+                "attempt_count": int(previous.get("attempt_count", 0)) + 1,
+                "failure_count": int(previous.get("failure_count", 0)), "next_retry_at": 0.0}
+            await self._scheduler.schedule(scheduled)
+            self._attempt_context.set({"kind": "scheduled", "event_id": scheduled.id, "claim_id": candidate.action_id})
 
         if revision != await self._store.get_revision(session_id):
             candidate.status = ActionStatus.CANCELLED
@@ -487,15 +601,21 @@ class AgentLoop:
             metadata={"proactive": True, "action_id": candidate.action_id},
             payload={},
         )
+        self._audit_context.get()["trace_id"] = agent_event.trace_id
         await self._audit("memory_start")
         try:
             memories = await self._memory.recall(agent_event, perception, state, relationship)
-        except Exception:
+        except Exception as exc:
             candidate.status = ActionStatus.CANCELLED
             await self._store.save_action(candidate)
-            await self._do_nothing("memory recall failed", session_id=session_id)
+            await self._finish_attempt(retryable=True, error_kind=type(exc).__name__)
+            await self._do_nothing("memory recall failed", session_id=session_id, error_type=type(exc).__name__)
             return
         await self._audit("memory", memory_count=len(memories))
+
+        if daily_event_day and not self._daily_window_open(daily_event_day):
+            await self._do_nothing("daily_window_elapsed", session_id=session_id)
+            return
 
         gate_decision = None
         if self._decision_gate is not None:
@@ -504,15 +624,29 @@ class AgentLoop:
                 candidate, drives, relationship, memories, availability, agent_event.trace_id
             )
             await self._audit("jev", decision=gate_decision.action, shadow_action=gate_decision.shadow_action,
-                              reason=gate_decision.reason)
+                              reason=gate_decision.reason, retryable=getattr(gate_decision, "retryable", False),
+                              **getattr(gate_decision, "diagnostic", {}))
             if gate_decision.action in {"do_nothing", "defer"}:
+                retryable = bool(getattr(gate_decision, "retryable", False))
+                await self._finish_attempt(retryable=retryable,
+                                           error_kind=getattr(gate_decision, "diagnostic", {}).get("error_kind", "DecisionUnavailable") if retryable else None)
                 candidate.status = ActionStatus.CANCELLED
                 await self._store.save_action(candidate)
-                if scheduled:
+                if scheduled and not retryable:
                     await self._scheduler.mark_evaluated(scheduled.id)
-                await self._do_nothing(gate_decision.reason, score=decision.score, session_id=session_id)
+                await self._do_nothing(gate_decision.reason, score=decision.score, session_id=session_id,
+                                       reason_code="jev_unavailable" if retryable else "jev_decision_rejected",
+                                       retryable=retryable)
                 return
 
+        if daily_event_day and not self._daily_window_open(daily_event_day):
+            await self._do_nothing("daily_window_elapsed", session_id=session_id)
+            return
+        if not await self._finish_attempt():
+            candidate.status = ActionStatus.CANCELLED
+            await self._store.save_action(candidate)
+            await self._do_nothing("attempt_ownership_lost", session_id=session_id)
+            return
         candidate.status = ActionStatus.PLANNED
         await self._store.save_action(candidate)
         if gate_decision is not None and gate_decision.action == "send":
@@ -550,6 +684,9 @@ class AgentLoop:
             return
 
         selected = self._memory.select_for_response(memories, plan.memory_ids)
+        if daily_event_day and not self._daily_window_open(daily_event_day):
+            await self._do_nothing("daily_window_elapsed", session_id=session_id)
+            return
         action_plan = ActionPlan(
             action="recall_then_reply" if selected else "reply",
             intent="proactive_follow_up", response_goal=plan.response_goal or candidate.reason,
