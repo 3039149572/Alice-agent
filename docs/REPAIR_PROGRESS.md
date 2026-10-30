@@ -1,6 +1,29 @@
 # Reliability repair tracker
 
-## Current: v0.9.3, 2026-10-25
+## Current: v0.9.4 publication batch, 2026-10-30
+
+Baseline: 5ef5b44 / v0.9.3. The user requested the proactive-chain change and
+a version bump. Replace the indefinite unanswered gate with a configurable
+24-hour wait and at most two unanswered contacts in a rolling 72-hour window,
+including the initial contact. User input starts a fresh unanswered segment.
+Old sends ageing out restore evaluation, subject to all original gates.
+Scheduled follow-ups keep the original exception. Runtime, pre-send and status
+inspection share one read-only policy. Send retention now covers the observation
+window (with the original 48-hour minimum); old pruned history cannot be rebuilt.
+
+The targeted proactive/diagnostic/retry run passed 56 tests. Full unpacked-package
+validation passed **376 tests in 19.635s**, compiled 199 Python sources and checked
+137 effective schema defaults, 236 package sources and per-file hashes. The 17
+new tests cover expiry, legacy timestamps, reset/isolation, retention/restart,
+pre-send rechecks, partial delivery, unchanged gates and read-only diagnostics.
+After the documentation update all 218 non-Markdown file hashes are compared
+with the tested package. See VALIDATION_CURRENT.md. After local validation the
+user explicitly authorized GitHub publication. Remote evidence is the matching
+Windows/Linux Actions run, main/tag SHA, Release and tested artifact digest.
+No production configuration/database edits, reload or real-model/QQ test have
+been performed in this batch. The version bump alone does not publish it.
+
+## Previous published batch: v0.9.3, 2026-10-25
 
 The user authorized Jev failure retries, daily-event gating, detailed failure
 logs and a new GitHub release. Baseline: 414faf5 / published v0.9.2.

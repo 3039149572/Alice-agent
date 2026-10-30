@@ -20,6 +20,7 @@ MESSAGES = {
     "loop_disabled": "后台循环已关闭，不会执行主动消息判断",
     "tick": "开始本轮检查；没有已登记会话时不会产生主动候选",
     "evaluation": "开始评估此会话",
+    "unanswered": "检查未回复后的有限等待及滚动次数限制",
     "daily_events_start": "读取或生成当日事件",
     "daily_events": "当日事件检查完成",
     "daily_events_error": "当日事件检查异常，本轮继续按现有规则判断",
@@ -64,6 +65,8 @@ REASONS = {
     "proactive disabled": "主动消息开关已关闭",
     "outside local send window": "不在允许发送的服务器本地时段",
     "previous proactive message is unanswered": "上次主动消息尚未收到回应",
+    "unanswered_wait": "上次主动消息未回复，仍在有限等待期；到期后重新评估其他发送条件",
+    "unanswered_limit": "滚动观察窗口内未回复主动次数已达上限，等待旧记录移出窗口或新的正常用户消息",
     "daily probability chose silence": "当日概率结果选择安静，今天不会重新抽签",
     "daily proactive attempt limit reached": "当日规划尝试额度已用完",
     "session inactive over 7 days": "会话超过七天未活跃",
@@ -189,6 +192,11 @@ class DailyProactiveLogger:
                 except (ValueError, OSError, OverflowError):
                     pass
             with self.path.open("a", encoding="utf-8", newline="\n") as stream:
+                if isinstance(record.get("next_evaluable_at"), (int, float)):
+                    try:
+                        record["next_evaluable_local"] = datetime.fromtimestamp(record["next_evaluable_at"]).isoformat()
+                    except (ValueError, OSError, OverflowError):
+                        pass
                 stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
 
     async def record(self, stage: str, **details) -> None:

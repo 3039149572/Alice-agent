@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from .models import UserAvailability
 from .policies import LocalTimeWindow
 from .attempts import select_daily_event
+from .unanswered import unanswered_status
 
 
 REASONS = {
@@ -12,6 +13,8 @@ REASONS = {
     "proactive_disabled": "主动消息已关闭", "session_unregistered": "此会话尚未登记",
     "active_conversation": "仍在活跃聊天保护期", "outside_window": "不在允许发送的本地时段",
     "unanswered": "上次主动消息尚未收到回应", "session_inactive": "会话已超过七天未活跃",
+    "unanswered_wait": "上次主动消息未回复，仍在有限等待期",
+    "unanswered_limit": "滚动观察窗口内未回复主动次数已达上限",
     "daily_events_disabled": "每日事件已关闭", "events_not_generated": "今天的事件尚未生成",
     "no_candidate": "当前没有可分享的事件或到期待办", "attempt_limit": "今天的规划尝试已用完",
     "probability_silence": "今天的概率判断选择安静", "score_below_threshold": "候选评分未达到门槛",
@@ -96,9 +99,12 @@ class ProactiveInspector:
             if last is not None and now - float(last) > 7 * 86400:
                 blockers.append("session_inactive")
                 conditions.append("需要新的正常会话输入")
-            if last is not None and stats.get("session_last") is not None and float(last) <= stats["session_last"]:
-                blockers.append("unanswered")
-                conditions.append("先回应上次主动消息")
+            contact = await unanswered_status(loop._store, config, session_id, last, now)
+            result["unanswered_policy"] = contact
+            if not contact["allowed"]:
+                blockers.extend(contact["reason_codes"])
+                times.append(contact["next_evaluable_at"])
+                conditions.append("等待未回复保护的时间门槛恢复，或正常发送一条新消息后重新评估")
             if not config.daily_events_enabled:
                 blockers.append("daily_events_disabled")
             elif state.daily_event_day != day:
@@ -167,6 +173,11 @@ def format_status(status: dict) -> str:
     if status.get("daily_probability"):
         draw = status["daily_probability"]
         lines.append(f"今日已保存抽签：{'允许进一步规划' if draw.get('eligible') else '安静'}；概率 {draw.get('probability')}")
+    if status.get("unanswered_policy"):
+        contact = status["unanswered_policy"]
+        lines.append(f"未回复保护：最近{contact['window_seconds'] / 3600:g}小时内 "
+                     f"{contact['recent_unanswered_count']}/{contact['unanswered_limit']}条；"
+                     f"单次至少等待{contact['wait_seconds'] / 3600:g}小时")
     if status.get("next_evaluable_at"):
         lines.append("已知时间门槛：" + status["next_evaluable_at"])
     lines.extend(status["next_conditions"])

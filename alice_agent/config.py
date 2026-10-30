@@ -72,6 +72,9 @@ class AgentConfig:
     proactive_daily_attempt_limit: int = 2
     proactive_retry_base_seconds: float = 60.0
     proactive_retry_max_seconds: float = 900.0
+    proactive_unanswered_wait_seconds: float = 86400.0
+    proactive_unanswered_window_seconds: float = 259200.0
+    proactive_unanswered_limit: int = 2
     active_conversation_window: float = 900.0
     planner_timeout: float = 20.0
     proactive_social_weight: float = 0.18
@@ -209,6 +212,24 @@ class AgentConfig:
                 value = default
             object.__setattr__(self, name, min(3600.0, max(1.0, value)))
         object.__setattr__(self, "proactive_retry_max_seconds", max(self.proactive_retry_base_seconds, self.proactive_retry_max_seconds))
+        for name, default, minimum in (
+            ("proactive_unanswered_wait_seconds", 86400.0, 0.0),
+            ("proactive_unanswered_window_seconds", 259200.0, 3600.0),
+        ):
+            raw = getattr(self, name)
+            try:
+                value = float(raw) if not isinstance(raw, bool) else default
+                if not math.isfinite(value):
+                    value = default
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            object.__setattr__(self, name, min(2592000.0, max(minimum, value)))
+        try:
+            raw_limit = self.proactive_unanswered_limit
+            limit = int(raw_limit) if not isinstance(raw_limit, bool) else 2
+        except (TypeError, ValueError, OverflowError):
+            limit = 2
+        object.__setattr__(self, "proactive_unanswered_limit", min(10, max(1, limit)))
         mode = str(self.jev_mode).strip().lower()
         if mode not in {"off", "shadow", "hybrid", "primary"}:
             mode = "shadow"

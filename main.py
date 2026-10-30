@@ -167,6 +167,9 @@ def _build_config(config: dict) -> AgentConfig:
         proactive_daily_attempt_limit=int(config.get("proactive_daily_attempt_limit", 2)),
         proactive_retry_base_seconds=config.get("proactive_retry_base_seconds", 60.0),
         proactive_retry_max_seconds=config.get("proactive_retry_max_seconds", 900.0),
+        proactive_unanswered_wait_seconds=config.get("proactive_unanswered_wait_seconds", 86400.0),
+        proactive_unanswered_window_seconds=config.get("proactive_unanswered_window_seconds", 259200.0),
+        proactive_unanswered_limit=config.get("proactive_unanswered_limit", 2),
         active_conversation_window=float(config.get("active_conversation_window", 900.0)),
         planner_timeout=float(config.get("planner_timeout", 20.0)),
         proactive_social_weight=float(config.get("proactive_social_weight", 0.18)),
@@ -555,16 +558,17 @@ class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
         self._data_service.delivery_recovery = pipeline.recover_deliveries
         self._decision_service = decision_service
         self._message_adapter = AstrBotMessageAdapter()
+        send_retention = self._config.proactive_unanswered_window_seconds
         if self._config.memory_backend.strip().lower() == "in_memory":
-            autonomy_store = InMemoryAutonomyStore()
+            autonomy_store = InMemoryAutonomyStore(send_retention_seconds=send_retention)
         else:
             try:
-                autonomy_store = SQLiteAutonomyStore(data_dir / "alice_autonomy.db")
+                autonomy_store = SQLiteAutonomyStore(data_dir / "alice_autonomy.db", send_retention_seconds=send_retention)
             except Exception:
                 self.logger.exception(
                     "Alice autonomy SQLite could not start; using volatile autonomy state"
                 )
-                autonomy_store = InMemoryAutonomyStore()
+                autonomy_store = InMemoryAutonomyStore(send_retention_seconds=send_retention)
         drive_manager = DriveManager(
             autonomy_store,
             DriveReducer(DriveReducerConfig(
@@ -695,6 +699,9 @@ class AliceAgentPlugin(ReactiveMessageMixin, ReplyDeliveryMixin, Star):
             "daily_attempt_period": "local_calendar_day", "daily_budget_period": "rolling_24h",
             "retry_base_seconds": self._config.proactive_retry_base_seconds,
             "retry_max_seconds": self._config.proactive_retry_max_seconds,
+            "unanswered_wait_seconds": self._config.proactive_unanswered_wait_seconds,
+            "unanswered_window_seconds": self._config.proactive_unanswered_window_seconds,
+            "unanswered_limit": self._config.proactive_unanswered_limit,
             "scheduled_attempt_limit": 3,
         })
         await self._data_service.start()

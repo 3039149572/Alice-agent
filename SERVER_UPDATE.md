@@ -1,5 +1,18 @@
 # 服务器安装与更新
 
+## v0.9.4 更新
+
+发布流程通过Windows/Linux解包测试后，从 [v0.9.4 Release](https://github.com/3039149572/Alice-agent/releases/tag/v0.9.4)
+下载 `alice-agent-source.zip`，或通过仓库更新/重新安装。本地验证包为 `dist/Alice-agent-0.9.4.zip`。
+停止插件并备份配置及整套插件数据后更新、重载，检查startup/heartbeat的实际版本。
+GitHub发布不代表服务器已更新或重载。
+
+新增默认：未回复至少等待24小时，滚动72小时内最多2条未回复主动（包括首条）。
+新用户消息或旧记录移出窗口后重新评估；其他评分、时段、冷却和预算仍需通过。
+三项参数和旧记录边界见 [未回复策略](docs/PROACTIVE_UNANSWERED.md)。
+发送元数据保留期会覆盖配置观察窗口；原来已经清理的历史不会重新生成。
+不需要清零任何数据库、计数或当天抽签。真实模型/QQ测试与服务器重载仍需单独进行。
+
 ## v0.9.3 更新
 
 安装 [v0.9.3 Release](https://github.com/3039149572/Alice-agent/releases/tag/v0.9.3) 的 `alice-agent-source.zip`，

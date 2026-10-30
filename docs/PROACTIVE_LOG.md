@@ -1,4 +1,4 @@
-# 当日主动消息诊断文件（v0.9.3）
+# 当日主动消息诊断文件（v0.9.4）
 
 固定路径是AstrBot插件数据目录中的 `data/plugin_data/astrbot_plugin_alice_agent/proactive_today.log`。
 以实际 `StarTools.get_data_dir("astrbot_plugin_alice_agent")` 返回的目录为准，容器内路径需映射到宿主机才能直接查看。
@@ -15,6 +15,12 @@
 
 ## 查看未发送原因
 
+v0.9.4增加 `unanswered` 阶段及startup/heartbeat的未回复等待、观察窗口和次数配置。
+`unanswered_wait` 与 `unanswered_limit` 分别表示等待期和滚动次数限制，
+`recent_unanswered_count` 显示窗口内计数，`next_evaluable_local` 是已知恢复时间。
+后台、每段发送前和状态查询共用策略；等待到期只恢复评估，不保证发送。
+历史只剩最后时间时 `history_source=last_timestamp_only`，完整规则见 [未回复策略](PROACTIVE_UNANSWERED.md)。
+
 先检查首行 `date`，再按 `session_id` 筛选。每轮有 `tick_id` 便于串联；平台分段记录只有 `session_id`，按相邻时间对应到同一发送过程。
 
 v0.9.3的startup/heartbeat增加实际metadata版本、退避参数，以及“本地自然日尝试”与
@@ -26,6 +32,7 @@ v0.9.3的startup/heartbeat增加实际metadata版本、退避参数，以及“�
 |---|---|
 | `startup` / `heartbeat` / `loop_disabled` | 开关、时段、间隔、评分、预算及尝试上限；心跳约每小时一次。 |
 | `tick` | 登记会话数和到期待办数；无会话时不会产生主动候选。 |
+| `unanswered` | 未回复后的有限等待、滚动计数、上限、历史来源及已知恢复时间；check区分早期判断和发送前复检。 |
 | `evaluation` / `daily_events` / `candidate_availability` | 此会话被评估、事件数量、超过七天未活跃、事件关闭或无可用事件。 |
 | `blocked` | 活跃保护、时段、未回复、无候选、冷却、预算、评分、概率安静、尝试耗尽、模型失败/安静、正文为空或发送拒绝。每次判断均记录，不沿用INFO日志每小时去重。 |
 | `score` / `probability` / `attempt` | 评分与门槛、当日概率/随机数/允许结果/来源、尝试及已送事件数量；不额外抽签。 |

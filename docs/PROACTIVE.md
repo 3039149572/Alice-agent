@@ -1,10 +1,14 @@
-# 主动消息链路与排查（v0.9.1）
+# 主动消息链路与排查（v0.9.4）
+
+v0.9.4把未回复后的持续硬拦截改为默认24小时等待与滚动72小时最多2条未回复主动，
+窗口移出记录后可重新评估。后台、发送前与状态查询共用规则，具体参数及旧记录边界见
+[未回复保护](PROACTIVE_UNANSWERED.md)。这不会保证每天发送，其他门槛和当天正反抽签仍保留。
 
 已确认的代码问题：每日事件默认关闭，普通闲聊也不一定产生定时上下文，所以只开主动消息开关可能没有候选。普通事件 relevance 为 `0.62 + 0.2 * importance`；importance=0.35、默认信任0.5且熟悉度/亲近度为0、社交需求为0、未完成好奇心为0、rest_need为0时，得分 `0.69*0.55 + 0.25*0.20 + (0.5/3)*0.15 - 0.7*0.15 = 0.3495`，旧版日常门槛0.45会拦截。新默认0.35让少量闲置增长即可通过，已有显式0.45不会自动改写，升级后请手动调整。
 
 ## 发送顺序
 
-已登记私聊会话 → 每日事件与状态推进 → 15分钟活跃保护 → 本地发送时段 → 上次主动消息未获回复保护 → 每日事件尝试记录 → 全局/用户/同话题冷却及滚动24小时预算 → 评分 → 当天概率 → 尝试占位 → Memory/Jev/Planner → 回复生成 → 会话 revision 复核及发送锁 → AstrBot → 实际交给框架的文本入历史 → 预算与送出事件记账。
+已登记私聊会话 → 普通状态/驱动推进 → 活跃保护 → 本地发送时段 → 未回复有限等待/滚动次数保护 → 读取或生成每日事件 → 每日事件尝试记录 → 全局/用户/同话题冷却及滚动24小时预算 → 评分 → 当天概率 → 尝试占位 → Memory/Jev/Planner → 回复生成 → 会话revision/时段/未回复/冷却复检及发送锁 → AstrBot分段文字发送 → 已接受内容入历史 → 预算与送出事件记账。
 
 日常候选只考虑最近7天聊过的会话。事件可为0件，概率通过后 Planner 仍可安静，用户新消息会取消旧主动行为；这些都是保留的行为约束。明确的定时跟进使用原路径，不参与每日生活分享抽签。
 
@@ -20,10 +24,10 @@
 
 ## 服务器核对
 
-1. 版本0.9.1且只加载一份Alice；开启 `agent_loop_enabled`、`proactive_enabled`、`daily_events_enabled`，`daily_event_max>=1`、`proactive_daily_attempt_limit>=1`、`proactive_daily_budget>=1`。日常评分门槛推荐0.35，旧实例可能仍保存0.45。
+1. 核对实际运行版本且只加载一份Alice；开启 `agent_loop_enabled`、`proactive_enabled`、`daily_events_enabled`，`daily_event_max>=1`、`proactive_daily_attempt_limit>=1`、`proactive_daily_budget>=1`。日常评分默认门槛0.35，旧实例可能仍保存0.45。
 2. 看 `PROACTIVE startup`：检查实际开关、事件上限、本地时间/时区、评分门槛、滚动24小时预算。09:00–21:00解释为服务器进程本地时区；Docker与宿主机可能不同。中国时间请配置进程/容器 `TZ=Asia/Shanghai`。
 3. 更新后先在私聊中发一条消息登记有效会话；等待活跃保护结束。没有历史会话就没有发送目标。
-4. INFO 的 `PROACTIVE session=... decision=...` 显示安静原因，每种原因每会话每小时至多一次；概率记录包含 probability/roll/eligible/source，不含事件或私聊原文。`score below conservative threshold` 表示仍被评分拦截；DEBUG会补充实际分数。`previous proactive message is unanswered` 表示已有框架交付记录且用户未回应。`daily_budget` 按滚动24小时计算。
+4. INFO 的 `PROACTIVE session=... decision=...` 显示安静原因，每种原因每会话每小时至多一次；概率记录包含 probability/roll/eligible/source，不含事件或私聊原文。`score below conservative threshold` 表示评分拦截；`unanswered_wait` / `unanswered_limit` 表示有限等待/滚动未回复次数拦截，历史版本的 `previous proactive message is unanswered` 为旧硬拦截。`daily_budget` 按滚动24小时计算。逐轮细节及已知恢复时间见 `proactive_today.log` 和 `/alice-status`。
 5. `sender_rejected` 是 AstrBot 明确返回False，检查会话路由；异常看适配器日志。返回True只表示框架找到平台且发送调用完成，不是QQ送达回执。有的适配器会在内部跳过而不抛错，插件无法从统一布尔返回值识别。
 
 本机当前 QQ 官方适配器存在私聊主动发送实现；Context 旧注释称“不支持”不能代替实现核对。服务器框架版本、平台权限、msg_id/场景缓存和API限制均需实测，不能仅凭本地mock判为平台已送达。

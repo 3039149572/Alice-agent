@@ -16,7 +16,8 @@ from ..proactive.attempts import empty_daily_state, reserve_attempt, finish_atte
 
 
 class InMemoryAutonomyStore:
-    def __init__(self) -> None:
+    def __init__(self, *, send_retention_seconds: float = 259200.0) -> None:
+        self._send_retention_seconds = max(172800.0, float(send_retention_seconds))
         self.drives: dict[str, DriveState] = {}
         self.sessions: dict[str, dict[str, Any]] = {}
         self.scheduled: dict[str, ScheduledContextEvent] = {}
@@ -89,7 +90,8 @@ class InMemoryAutonomyStore:
 
     async def record_send(self, user_id: str, session_id: str, topic: str | None, timestamp: float) -> None:
         self.sends.append({"user_id": user_id, "session_id": session_id, "topic": topic or "", "sent_at": timestamp})
-        self.last_proactive_by_session[session_id] = float(timestamp)
+        self.last_proactive_by_session[session_id] = max(
+            float(timestamp), self.last_proactive_by_session.get(session_id, float(timestamp)))
 
     async def send_stats(
         self, user_id: str, topic: str | None, day_start: float,
@@ -104,6 +106,14 @@ class InMemoryAutonomyStore:
             "topic_last": max((x["sent_at"] for x in topic_rows), default=None),
             "daily_count": sum(1 for x in user if x["sent_at"] >= day_start),
         }
+
+    async def unanswered_stats(self, session_id, last_interaction_at, window_start, limit):
+        times = sorted((row["sent_at"] for row in self.sends
+                        if row["session_id"] == session_id
+                        and row["sent_at"] >= last_interaction_at
+                        and row["sent_at"] > window_start), reverse=True)
+        return {"last_sent_at": self.last_proactive_by_session.get(session_id),
+                "recent_count": len(times), "recent_send_times": times[:limit]}
 
     async def get_daily_proactive_state(self, session_id: str, day: str) -> dict[str, Any]:
         return copy.deepcopy({**empty_daily_state(), **self.daily_proactive.get((session_id, day), {})})
@@ -157,7 +167,7 @@ class InMemoryAutonomyStore:
         return None
 
     async def maintenance(self, now: float) -> None:
-        self.sends = [row for row in self.sends if row["sent_at"] >= now - 172800.0]
+        self.sends = [row for row in self.sends if row["sent_at"] >= now - self._send_retention_seconds]
         cutoff = (datetime.fromtimestamp(now).date() - timedelta(days=30)).isoformat()
         self.daily_decisions = {k: v for k, v in self.daily_decisions.items() if k[1] >= cutoff}
         self.daily_proactive = {
@@ -171,7 +181,8 @@ class InMemoryAutonomyStore:
 class SQLiteAutonomyStore:
     """Small durable store for drive, cooldown, schedule and action validity state."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, send_retention_seconds: float = 259200.0) -> None:
+        self._send_retention_seconds = max(172800.0, float(send_retention_seconds))
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
@@ -202,6 +213,8 @@ class SQLiteAutonomyStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_proactive_sends_user_time
                     ON proactive_sends(user_id, sent_at);
+                CREATE INDEX IF NOT EXISTS idx_proactive_sends_session_time
+                    ON proactive_sends(session_id, sent_at);
                 CREATE TABLE IF NOT EXISTS proactive_session_state (
                     session_id TEXT PRIMARY KEY, last_sent_at REAL NOT NULL
                 );
@@ -403,6 +416,21 @@ class SQLiteAutonomyStore:
                 return {"global_last":global_last,"user_last":user_last,"session_last":session_last,"topic_last":topic_last,"daily_count":int(daily_count)}
         return await self._run(query)
 
+    async def unanswered_stats(self, session_id, last_interaction_at, window_start, limit):
+        def query():
+            with closing(self._connect()) as db, db:
+                db.execute("BEGIN")
+                row = db.execute("SELECT last_sent_at FROM proactive_session_state WHERE session_id=?",
+                                 (session_id,)).fetchone()
+                params = (session_id, last_interaction_at, window_start)
+                predicate = "FROM proactive_sends WHERE session_id=? AND sent_at>=? AND sent_at>?"
+                count = db.execute("SELECT COUNT(*) " + predicate, params).fetchone()[0]
+                times = [item[0] for item in db.execute(
+                    "SELECT sent_at " + predicate + " ORDER BY sent_at DESC LIMIT ?", (*params, limit))]
+                return {"last_sent_at": row[0] if row else None,
+                        "recent_count": int(count), "recent_send_times": times}
+        return await self._run(query)
+
     async def get_daily_proactive_state(self, session_id: str, day: str) -> dict[str, Any]:
         def query():
             with closing(self._connect()) as db:
@@ -490,7 +518,7 @@ class SQLiteAutonomyStore:
         cutoff = (datetime.fromtimestamp(now).date() - timedelta(days=30)).isoformat()
         def query():
             with closing(self._connect()) as db, db:
-                db.execute("DELETE FROM proactive_sends WHERE sent_at<?", (now - 172800.0,))
+                db.execute("DELETE FROM proactive_sends WHERE sent_at<?", (now - self._send_retention_seconds,))
                 db.execute("DELETE FROM daily_proactive_state WHERE day<?", (cutoff,))
                 db.execute("DELETE FROM daily_proactive_decisions WHERE day<?", (cutoff,))
                 db.execute("DELETE FROM daily_proactive_attempt_leases WHERE day<?", (cutoff,))

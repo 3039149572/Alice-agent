@@ -38,7 +38,7 @@ class ProactiveDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
         await store.record_send("u", "s", "topic", now - 1800)
         status = await loop.inspect_session("s", "u")
         self.assertIn("probability_silence", status["blockers"])
-        self.assertIn("unanswered", status["blockers"])
+        self.assertIn("unanswered_wait", status["blockers"])
         self.assertEqual(await store.get_daily_proactive_decision("s", day), saved)
         self.assertTrue(any("下一本地日期" in text for text in status["next_conditions"]))
 

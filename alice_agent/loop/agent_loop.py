@@ -21,6 +21,7 @@ from ..ports.logging import LoggerPort
 from ..proactive.cooldown import CooldownManager
 from ..proactive.daily_policy import DailyProactivePolicy
 from ..proactive.attempts import select_daily_event
+from ..proactive.unanswered import unanswered_status
 from ..async_utils import finish_before_cancelling
 from ..proactive.evaluator import ProactiveEvaluator
 from ..proactive.models import (
@@ -387,13 +388,13 @@ class AgentLoop:
         if not scheduled and not in_send_window:
             await self._do_nothing("outside local send window", session_id=session_id)
             return
-        if last_interaction is not None and scheduled is None:
-            send_stats = await self._store.send_stats(
-                user_id, None, now - 86400.0, session_id
-            )
-            last_proactive = send_stats.get("session_last")
-            if last_proactive is not None and last_interaction <= float(last_proactive):
-                await self._do_nothing("previous proactive message is unanswered", session_id=session_id)
+        if scheduled is None:
+            contact = await unanswered_status(self._store, self._config, session_id, last_interaction, now)
+            await self._audit("unanswered", check="evaluation", **contact)
+            if not contact["allowed"]:
+                await self._do_nothing(contact["reason_code"], session_id=session_id,
+                                       next_evaluable_at=contact["next_evaluable_at"],
+                                       recent_unanswered_count=contact["recent_unanswered_count"])
                 return
 
         if scheduled:
@@ -729,6 +730,14 @@ class AgentLoop:
             ):
                 await self._audit("pre_send_blocked", reason="生成期间已跨日或离开发送时段")
                 return False
+            if scheduled is None:
+                contact = await unanswered_status(self._store, self._config, session_id, last_interaction, send_now)
+                await self._audit("unanswered", check="pre_send", **contact)
+                if not contact["allowed"]:
+                    await self._audit("pre_send_blocked", reason=contact["reason_code"],
+                                      reason_code=contact["reason_code"],
+                                      next_evaluable_at=contact["next_evaluable_at"])
+                    return False
             allowed, reason = await self._cooldown.check(
                 user_id, candidate.topic, send_now, session_id=session_id,
             )
